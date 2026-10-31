@@ -1,0 +1,2 @@
+# Chỉ giao diện cần thư viện ngoài; agent nền chạy thuần stdlib.
+customtkinter==6.0.0

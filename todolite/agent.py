@@ -1,0 +1,310 @@
+"""Tiến trình nền: icon khay, lịch nhắc, thông báo, phím tắt toàn cục.
+
+Không dùng vòng lặp sleep: tiến trình nằm yên trong GetMessageW (0% CPU) và chỉ thức
+dậy đúng lúc có việc, nhờ timer đặt tới mốc nhắc gần nhất. Giao diện báo "dữ liệu đổi"
+bằng một PostMessage để agent tính lại lịch ngay.
+"""
+from ctypes import byref, sizeof
+from ctypes import wintypes as w
+from datetime import datetime, timedelta
+
+from . import APP_ID, APP_NAME, integration, schedule, toast
+from .db import Store
+from .paths import ICON_ALERT_PATH, ICON_PATH, ROOT, RUN_SCRIPT, SANDBOX, log, pythonw
+from .popups import QuickAdd, ReminderCard, TimerPill
+from .win32 import *  # noqa: F403
+
+TIMER_TICK = 1
+HOTKEY_QUICK_ADD = 1
+MAX_SLEEP = timedelta(minutes=5)  # lưới an toàn: agent vẫn tự rà soát định kỳ
+MAX_INDIVIDUAL_ALERTS = 3
+
+MENU_OPEN, MENU_QUICK_ADD, MENU_SUMMARY, MENU_AUTOSTART, MENU_QUIT = 1, 2, 3, 4, 5
+
+
+class Agent:
+    def __init__(self, autostarted=False, open_ui=False):
+        self.store = Store(cache_kb=128)
+        self.pending_summary = autostarted
+        self.open_ui_on_start = open_ui
+        self.first_tick = True
+        self.locked = False
+        self.tray_added = False
+        self.hotkey_on = False
+        self.icon_name = ""
+        self.icons = {}
+        self._procedure = WNDPROC(self._window_proc)
+        self.taskbar_created = RegisterWindowMessageW("TaskbarCreated")
+
+    # ---------- Vòng đời ----------
+
+    def run(self):
+        SetProcessDpiAwarenessContext(DPI_PER_MONITOR_V2)
+        SetAppUserModelID(APP_ID)
+        if not SANDBOX:
+            integration.register_app()
+            integration.refresh_autostart()
+        register_window_class(AGENT_WINDOW_CLASS, self._procedure)
+        self.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, AGENT_WINDOW_CLASS, APP_NAME, WS_POPUP, 0, 0, 0, 0,
+                                    None, None, HINSTANCE, None)
+        self.quick = QuickAdd(self)
+        self.pill = TimerPill(self)
+        self.card = ReminderCard(self)
+        register_session_notification(self.hwnd)
+        self._add_tray()
+        self.tick()
+        if self.open_ui_on_start:
+            self.open_ui()
+        self._message_loop()
+
+    def _message_loop(self):
+        message = w.MSG()
+        while GetMessageW(byref(message), None, 0, 0) > 0:
+            try:
+                if self.quick.handle_key(message):
+                    continue
+            except Exception as error:
+                self.report(error)  # lỗi lẻ không được phép giết tiến trình nền
+            TranslateMessage(byref(message))
+            DispatchMessageW(byref(message))
+
+    def _sync_hotkey(self):
+        wanted = self.store.setting("hotkey") == "1"
+        if wanted and not self.hotkey_on:
+            self.hotkey_on = bool(RegisterHotKey(self.hwnd, HOTKEY_QUICK_ADD, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_T))
+            if not self.hotkey_on and self.first_tick:
+                log("Không đăng ký được Ctrl+Alt+T: phím đang bị ứng dụng khác dùng")
+        elif self.hotkey_on and not wanted:
+            UnregisterHotKey(self.hwnd, HOTKEY_QUICK_ADD)
+            self.hotkey_on = False
+
+    def report(self, error):
+        import traceback
+        log("".join(traceback.format_exception(error)))
+
+    def quit(self):
+        self._remove_tray()
+        PostQuitMessage(0)
+
+    # ---------- Khay hệ thống ----------
+
+    def _icon(self, path):
+        if path not in self.icons:
+            width, height = GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)
+            self.icons[path] = LoadImageW(None, path, IMAGE_ICON, width, height, LR_LOADFROMFILE)
+        return self.icons[path]
+
+    def _tray_data(self, flags):
+        data = NOTIFYICONDATAW()
+        data.cbSize = sizeof(NOTIFYICONDATAW)
+        data.hWnd = self.hwnd
+        data.uID = 1
+        data.uFlags = flags
+        return data
+
+    def _add_tray(self):
+        data = self._tray_data(NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP)
+        data.uCallbackMessage = WM_APP_TRAY
+        data.hIcon = self._icon(ICON_PATH)
+        data.szTip = APP_NAME
+        self.tray_added = bool(Shell_NotifyIconW(NIM_ADD, byref(data)))
+        if self.tray_added:
+            data.uVersion = NOTIFYICON_VERSION_4
+            Shell_NotifyIconW(NIM_SETVERSION, byref(data))
+            self.icon_name = ""
+        else:
+            log("Chưa thêm được icon khay (Explorer chưa sẵn sàng?), sẽ thử lại")
+
+    def _remove_tray(self):
+        if self.tray_added:
+            Shell_NotifyIconW(NIM_DELETE, byref(self._tray_data(0)))
+            self.tray_added = False
+
+    def _update_tray(self, tooltip, icon_path):
+        if not self.tray_added:
+            self._add_tray()
+            if not self.tray_added:
+                return
+        flags = NIF_TIP | NIF_SHOWTIP | (NIF_ICON if icon_path != self.icon_name else 0)
+        data = self._tray_data(flags)
+        data.szTip = tooltip[:127]
+        data.hIcon = self._icon(icon_path)
+        Shell_NotifyIconW(NIM_MODIFY, byref(data))
+        self.icon_name = icon_path
+
+    def _balloon(self, title, text):
+        """Dự phòng khi toast WinRT lỗi: thông báo kiểu cũ qua khay hệ thống."""
+        data = self._tray_data(NIF_INFO)
+        data.szInfoTitle = title[:63]
+        data.szInfo = text[:255]
+        data.dwInfoFlags = NIIF_USER
+        data.hBalloonIcon = self._icon(ICON_PATH)
+        Shell_NotifyIconW(NIM_MODIFY, byref(data))
+
+    def _show_menu(self, x, y):
+        autostart = integration.autostart_enabled()
+        items = [(MENU_OPEN, f"Mở {APP_NAME}", False, True),
+                 (MENU_QUICK_ADD, "Thêm nhanh…\tCtrl+Alt+T", False, True),
+                 (0, "", False, True),
+                 (MENU_SUMMARY, "Gửi lại tóm tắt hôm nay", False, True),
+                 (MENU_AUTOSTART, "Khởi động cùng Windows", autostart, True),
+                 (0, "", False, True),
+                 (MENU_QUIT, "Thoát", False, True)]
+        chosen = show_context_menu(self.hwnd, items, x, y)
+        if chosen == MENU_OPEN:
+            self.open_ui()
+        elif chosen == MENU_QUICK_ADD:
+            self.quick.show()
+        elif chosen == MENU_SUMMARY:
+            self.send_summary(datetime.now())
+        elif chosen == MENU_AUTOSTART:
+            integration.set_autostart(not autostart)
+        elif chosen == MENU_QUIT:
+            self.quit()
+
+    # ---------- Giao diện ----------
+
+    def open_ui(self):
+        hwnd = FindWindowW(UI_WINDOW_CLASS, APP_NAME)
+        AllowSetForegroundWindow(ASFW_ANY)
+        if hwnd:
+            if IsIconic(hwnd):
+                ShowWindow(hwnd, SW_RESTORE)
+            SetForegroundWindow(hwnd)
+        else:
+            ShellExecuteW(None, "open", pythonw(), f'"{RUN_SCRIPT}" --ui', ROOT, SW_SHOWNORMAL)
+
+    def open_task(self, task_id):
+        self.store.set_setting("ui_request", f"task:{task_id}")
+        self.open_ui()
+
+    # ---------- Lịch nhắc ----------
+
+    def tick(self):
+        """Đối chiếu toàn bộ lịch với hiện tại, rồi hẹn lần thức tiếp theo."""
+        now = datetime.now()
+        upcoming = None
+        try:
+            self._sync_hotkey()
+            self._daily(now)
+            late_limit = schedule.STARTUP_LATE_LIMIT if self.first_tick else schedule.LATE_LIMIT
+            tasks = self.store.scheduled_tasks()
+            show, skip, upcoming = schedule.collect(tasks, self.store.sent_keys(), now, late_limit)
+            block = schedule.active_block(tasks, now)
+            self.pill.sync(block)
+            self._notify(show, now)
+            self.store.mark_sent(show + skip)
+            self.card.refresh(now)
+            self._refresh_tray(now, block)
+        except Exception as error:
+            self.report(error)
+        finally:
+            self.first_tick = False
+            self._arm_timer(now, upcoming)
+            if not (self.pill.block or self.card.queue or self.quick.hwnd):
+                K32EmptyWorkingSet(GetCurrentProcess())  # sắp ngủ lâu: trả RAM vật lý cho hệ thống
+
+    def _summary_due(self, now):
+        moment = self.store.setting("summary_time")
+        return f"{now:%H:%M}" >= moment and self.store.setting("last_summary") != now.date().isoformat()
+
+    def _daily(self, now):
+        today = now.date().isoformat()
+        if self.store.setting("last_maintenance") != today:
+            self.store.maintenance(today)
+            self.store.set_setting("last_maintenance", today)
+        if self.pending_summary or (self._summary_due(now) and not self.locked):
+            self.pending_summary = False
+            self.send_summary(now)
+
+    def send_summary(self, now):
+        overdue, today = self.store.summary_tasks(now)
+        title, lines = schedule.summary_message(overdue, today, now)
+        self._toast(title, lines)
+        self.store.set_setting("last_summary", now.date().isoformat())
+
+    def _notify(self, events, now):
+        if len(events) > MAX_INDIVIDUAL_ALERTS:
+            self._toast(f"{len(events)} nhắc nhở cần xem", [task["title"] for task, _, _ in events[:3]])
+            return
+        available = user_is_available()
+        for task, kind, _ in events:
+            if available and kind != "block_start":
+                self.card.push(task["id"], kind, now)
+            else:
+                self._toast(*self._toast_text(task, kind, now))
+
+    @staticmethod
+    def _toast_text(task, kind, now):
+        title, line = schedule.describe_event(task, kind, now)
+        return title, [line]
+
+    def _toast(self, title, lines):
+        try:
+            toast.show(title, lines)
+        except OSError as error:
+            log(f"Toast WinRT lỗi ({error}), chuyển sang balloon")
+            self._balloon(title, "\n".join(lines))
+
+    def _refresh_tray(self, now, block):
+        overdue, today = self.store.summary_tasks(now)
+        tooltip = f"{APP_NAME}\n{len(today)} việc hôm nay · {len(overdue)} quá hạn"
+        if block:
+            tooltip += f"\nCòn {schedule.humanize(block[2] - now)}: {block[0]['title']}"
+        self._update_tray(tooltip, ICON_ALERT_PATH if overdue else ICON_PATH)
+
+    def _arm_timer(self, now, upcoming):
+        midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+        targets = [now + MAX_SLEEP, midnight]
+        if upcoming:
+            targets.append(upcoming)
+        hour, minute = self.store.setting("summary_time").split(":")
+        summary_at = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if summary_at > now:
+            targets.append(summary_at)
+        if self.pill.block or self.card.queue:
+            targets.append(now + timedelta(minutes=1))  # cập nhật đếm ngược trên tooltip và thẻ nhắc
+        delay = (min(targets) - now).total_seconds()
+        SetTimer(self.hwnd, TIMER_TICK, max(int(delay * 1000) + 50, 200), None)
+
+    # ---------- Thông điệp Windows ----------
+
+    def _on_tray_event(self, wparam, lparam):
+        event = low_word(lparam)
+        if event in (NIN_SELECT, NIN_KEYSELECT, NIN_BALLOONUSERCLICK):
+            self.open_ui()
+        elif event == WM_CONTEXTMENU:
+            self._show_menu(signed_word(wparam), signed_word(wparam >> 16))
+
+    def _window_proc(self, hwnd, message, wparam, lparam):
+        try:
+            if message == WM_TIMER and wparam == TIMER_TICK:
+                self.tick()
+            elif message == WM_APP_TRAY:
+                self._on_tray_event(wparam, lparam)
+            elif message == WM_APP_DATA or message == WM_TIMECHANGE:
+                self.tick()
+            elif message == WM_APP_OPEN:
+                self.open_ui()
+            elif message == WM_APP_SUMMARY:
+                self.send_summary(datetime.now())
+            elif message == WM_HOTKEY and wparam == HOTKEY_QUICK_ADD:
+                self.quick.show()
+            elif message == WM_POWERBROADCAST and wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
+                self.tick()
+            elif message == WM_WTSSESSION_CHANGE and wparam in (WTS_SESSION_LOCK, WTS_SESSION_UNLOCK):
+                self.locked = wparam == WTS_SESSION_LOCK
+                if not self.locked:
+                    self.tick()
+            elif message == self.taskbar_created:
+                self._add_tray()  # Explorer khởi động lại: icon khay cũ đã mất
+                self.tick()
+            elif message in (WM_CLOSE, WM_ENDSESSION) and (message == WM_CLOSE or wparam):
+                self.quit()
+                return 0
+            else:
+                return DefWindowProcW(hwnd, message, wparam, lparam)
+            return 0
+        except Exception as error:
+            self.report(error)
+            return DefWindowProcW(hwnd, message, wparam, lparam)

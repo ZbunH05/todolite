@@ -1,0 +1,12 @@
+# Thư viện ngoài, setup.bat sẽ cài lại vào đây
+vendor/
+
+# Python
+__pycache__/
+*.pyc
+
+# Dữ liệu chạy thử: dữ liệu thật nằm ở %LOCALAPPDATA%\TodoLite, không nằm trong repo
+*.db
+*.db-wal
+*.db-shm
+*.log

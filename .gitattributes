@@ -1,0 +1,5 @@
+# cmd.exe cần xuống dòng CRLF, mọi file khác dùng LF
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ico binary
+*.png binary
