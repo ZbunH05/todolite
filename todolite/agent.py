@@ -18,6 +18,7 @@ TIMER_TICK = 1
 HOTKEY_QUICK_ADD = 1
 MAX_SLEEP = timedelta(minutes=5)  # lưới an toàn: agent vẫn tự rà soát định kỳ
 MAX_INDIVIDUAL_ALERTS = 3
+BRIEF_RETRY = timedelta(minutes=5)  # lỗi mạng thì thử lại sau chừng này
 
 MENU_OPEN, MENU_QUICK_ADD, MENU_SUMMARY, MENU_AUTOSTART, MENU_QUIT = 1, 2, 3, 4, 5
 
@@ -33,6 +34,9 @@ class Agent:
         self.hotkey_on = False
         self.icon_name = ""
         self.icons = {}
+        self.resumed = False
+        self.brief_start_day = None  # ngày PC bật gần nhất, tính cả lúc mở nắp máy sau khi ngủ
+        self.brief_spawned_at = None
         self._procedure = WNDPROC(self._window_proc)
         self.taskbar_created = RegisterWindowMessageW("TaskbarCreated")
 
@@ -216,6 +220,20 @@ class Agent:
         if self.pending_summary or (self._summary_due(now) and not self.locked):
             self.pending_summary = False
             self.send_summary(now)
+        self._send_brief_if_due(now)
+
+    def _send_brief_if_due(self, now):
+        """Bản tin Telegram chạy ở tiến trình riêng: agent không nạp thư viện mạng, cũng không bị nghẽn."""
+        settings = {key: self.store.setting(key) for key in schedule.BRIEF_SETTINGS}
+        if self.first_tick or self.resumed:
+            self.resumed = False
+            self.brief_start_day = now.date()
+        if not schedule.brief_due(settings, now, self.brief_start_day == now.date()):
+            return
+        if self.brief_spawned_at and now - self.brief_spawned_at < BRIEF_RETRY:
+            return
+        self.brief_spawned_at = now
+        ShellExecuteW(None, "open", pythonw(), f'"{RUN_SCRIPT}" --telegram', ROOT, SW_HIDE)
 
     def send_summary(self, now):
         overdue, today = self.store.summary_tasks(now)
@@ -258,10 +276,11 @@ class Agent:
         targets = [now + MAX_SLEEP, midnight]
         if upcoming:
             targets.append(upcoming)
-        hour, minute = self.store.setting("summary_time").split(":")
-        summary_at = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-        if summary_at > now:
-            targets.append(summary_at)
+        for key in ("summary_time", "telegram_time"):
+            hour, minute = self.store.setting(key).split(":")
+            moment = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+            if moment > now:
+                targets.append(moment)
         if self.pill.block or self.card.queue:
             targets.append(now + timedelta(minutes=1))  # cập nhật đếm ngược trên tooltip và thẻ nhắc
         delay = (min(targets) - now).total_seconds()
@@ -291,6 +310,7 @@ class Agent:
             elif message == WM_HOTKEY and wparam == HOTKEY_QUICK_ADD:
                 self.quick.show()
             elif message == WM_POWERBROADCAST and wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
+                self.resumed = self.resumed or wparam == PBT_APMRESUMESUSPEND  # máy tự thức để bảo trì thì không tính
                 self.tick()
             elif message == WM_WTSSESSION_CHANGE and wparam in (WTS_SESSION_LOCK, WTS_SESSION_UNLOCK):
                 self.locked = wparam == WTS_SESSION_LOCK

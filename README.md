@@ -12,6 +12,9 @@
 - Time-blocking: đếm ngược trên Dashboard và đồng hồ nổi góc màn hình
 - Thêm nhanh bằng câu tiếng Việt tự nhiên, phím tắt `Ctrl+Alt+T` ở bất kỳ đâu
 - Việc lặp lại hằng ngày, T2–T6, hằng tuần, hằng tháng
+- Bot Telegram tâu bản tin mỗi ngày, xưng thần và gọi hoàng thượng, API cấu hình được trong Cài đặt
+- Lịch vạn niên: âm dương lịch, can chi, ngày và giờ hoàng đạo, tiết khí, ngày lễ, đổi ngày âm sang dương
+- Hỏi đáp tử vi qua AI theo chuẩn OpenAI, chưa có API key thì luận mẫu ngay trên máy
 
 ---
 
@@ -101,7 +104,7 @@ Giờ `1h` đến `6h` không kèm buổi được hiểu là buổi chiều (`h
 
 Bấm **Lịch** ở thanh bên, hoặc `Ctrl+2`. Chuyển **Tuần / Tháng** ở góc phải; app nhớ lựa chọn của bạn.
 
-- **Xem:** mỗi việc mang màu tag đầu tiên của nó. Chấm đỏ là quá hạn, chữ gạch ngang là đã xong. Việc lặp lại hiện đủ các lần trong tương lai, với màu nhạt hơn
+- **Xem:** mỗi việc mang màu tag đầu tiên của nó. Chấm đỏ là quá hạn, chữ gạch ngang là đã xong. Việc lặp lại hiện đủ các lần trong tương lai, với màu nhạt hơn. Số nhỏ cạnh ngày dương là ngày âm, mùng một ghi cả tháng
 - **Thêm:** bấm ô trống rồi gõ. Câu được hiểu theo ngày vừa bấm: ở ô thứ Năm, gõ `Họp 14h` là 14:00 thứ Năm. Trên lịch tuần, bấm đúng khung giờ là việc nằm ở giờ đó
 - **Dời lịch:** kéo việc sang ngày hoặc giờ khác, khớp theo từng 15 phút; thanh thông báo có nút **Hoàn tác**
 - **Đổi thời lượng:** trên lịch tuần, kéo mép dưới của việc. Việc chỉ có hạn chót sẽ thành khối thời gian
@@ -110,6 +113,55 @@ Bấm **Lịch** ở thanh bên, hoặc `Ctrl+2`. Chuyển **Tuần / Tháng** �
 - **Xem chi tiết:** bấm vào việc để mở panel bên phải. Ô có quá nhiều việc hiện `+N việc nữa`, bấm để mở tuần đó
 
 Kéo một khối giờ thì hạn chót nằm trong khối sẽ đi theo; hạn chót ở ngày khác đứng yên, nên bạn dời giờ làm mà không vô tình dời deadline.
+
+### Lịch vạn niên
+
+Bấm **Vạn niên** ở thanh bên, hoặc `Ctrl+3`.
+
+- **Lưới tháng:** ngày dương kèm ngày âm. Chấm vàng là ngày lễ, chấm xanh là ngày có việc
+- **Chuyển ngày:** bấm ô lịch, dùng phím mũi tên, cuộn chuột để đổi tháng, `T` về hôm nay. Gõ năm vào ô cạnh nút **Hôm nay** để nhảy tới năm bất kỳ từ 1800 đến 2199
+- **Chi tiết ngày:** ngày âm, tháng đủ hay thiếu, can chi của ngày, tháng và năm, ngày hoàng đạo hay hắc đạo, tiết khí, giờ hoàng đạo, ngày lễ, các việc trong ngày và một câu tục ngữ
+- **Thêm việc:** nút **+ Thêm việc** hoặc `Ctrl+N` thêm vào ngày đang chọn; gõ `Họp 14h` là 14:00 của chính ngày đó
+- **Sự kiện tháng:** bấm một dòng để tới ngày đó
+- **Đổi ngày âm sang dương:** nằm cuối cột bên phải, có ô chọn tháng nhuận
+
+Lịch được tính bằng thiên văn theo múi giờ UTC+7 và quy tắc lập lịch Việt Nam, không tra bảng, nên đúng cả những năm Việt Nam khác Trung Quốc: Tết 2007 là 17/2, Tết 1985 là 21/1. Vì dùng một quy tắc cho mọi năm, kết quả ở các năm xa, nhất là trước 1968, có thể khác lịch giấy in thời đó. Các trang lịch dùng nhiều trường phái nên nhãn ngày tốt xấu có thể không giống nhau; TodoLite dùng 12 vị thần trực ngày, sáu vị hoàng đạo và sáu vị hắc đạo.
+
+### Tử vi
+
+Trong trang Vạn niên, chọn **Tử vi** ở góc phải. Nhập ngày sinh nếu muốn, chọn câu gợi ý hoặc tự gõ câu hỏi. Ngày xem là ngày đang chọn trên lịch; năm sinh được tính theo âm lịch, người sinh trước Tết thuộc năm cũ.
+
+- **Chưa có API key:** app luận mẫu ngay trên máy từ dữ kiện lịch, không gửi gì ra ngoài, và có ghi rõ đây là bản mẫu
+- **Có API key:** vào **Cài đặt → AI cho trang Tử vi**, dán key. Câu trả lời hiện dần theo thời gian thực, bấm **Dừng** để ngắt. Mặc định dùng DeepSeek với model `deepseek-flash`; đổi API URL và Model là dùng được dịch vụ khác theo chuẩn OpenAI
+
+Khi đã có API key, câu hỏi, dữ kiện lịch và ngày sinh được gửi tới máy chủ AI bạn cấu hình. Nội dung tử vi chỉ để tham khảo.
+
+### Bot Telegram
+
+Mỗi ngày bot gửi một bản tin vào Telegram, xưng thần và gọi bạn là hoàng thượng: ngày âm dương, các deadline hôm nay, việc quá hạn, khối giờ và việc sắp tới.
+
+```text
+Tâu hoàng thượng,
+Hôm nay là Chủ Nhật, 01/11/2026, nhằm ngày 23 tháng 9 năm Bính Ngọ.
+Ngày Kỷ Mão, Câu Trần hắc đạo.
+
+Hôm nay hoàng thượng có deadline nộp đề án.
+
+Thần xin hầu bên cạnh, nhắc hoàng thượng từng việc.
+```
+
+**Cài đặt lần đầu**, trong **Cài đặt → Bot Telegram**:
+
+1. Nhắn `/newbot` cho [@BotFather](https://t.me/BotFather) để tạo bot, dán token vào ô **Bot Token**
+2. Mở bot vừa tạo, nhắn `/start`
+3. Bấm **Lấy tự động** để điền Chat ID, hoặc tự nhập nếu gửi vào nhóm hay kênh
+4. Bấm **Gửi thử** để xem bản tin ngay
+
+Bản tin đi mỗi ngày đúng một lần, theo mốc tới trước: lúc PC bật lần đầu trong ngày, kể cả mở máy lại sau khi ngủ, hoặc giờ đã đặt, mặc định 07:30. Tắt công tắc **Gửi khi PC bật lần đầu trong ngày** thì chỉ gửi đúng giờ. Nếu vừa cài xong mà đã quá giờ, bản tin đầu tiên đi vào ngày mai để app không tự nhắn khi bạn còn đang chỉnh; muốn xem liền thì bấm **Gửi thử**.
+
+Mạng chưa sẵn sàng lúc khởi động thì app tự thử lại nhiều lần. Lỗi cấu hình như sai token thì dừng tới hôm sau, hoặc tới khi bạn sửa, và hiện lý do ngay trong Cài đặt.
+
+Token và API key được mã hoá bằng DPAPI của Windows: file dữ liệu và bản sao lưu có lọt ra ngoài cũng không đọc được, nhưng chuyển sang máy khác thì phải nhập lại. **API URL** cho phép dùng máy chủ riêng hoặc proxy, và bắt buộc `https://`.
 
 ### Tag
 
@@ -151,12 +203,13 @@ Thẻ ở lại cho tới khi bạn xử lý, nên rời máy một lúc cũng k
 | `Ctrl+Alt+T` | Thêm nhanh ở bất kỳ đâu |
 | `Ctrl+N` | Thêm việc mới |
 | `Ctrl+F` | Tìm kiếm |
-| `Ctrl+1` đến `Ctrl+6` | Tổng quan, Lịch, Hôm nay, Sắp tới, Tất cả, Đã xong |
+| `Ctrl+1` đến `Ctrl+7` | Tổng quan, Lịch, Vạn niên, Hôm nay, Sắp tới, Tất cả, Đã xong |
 | `↑` `↓` | Chọn việc trong danh sách |
 | `Space` | Hoàn thành việc đang chọn |
 | `Esc` | Đóng panel chi tiết |
 | `←` `→` | Trên lịch: kỳ trước, kỳ sau |
 | `T`, `W`, `M` | Trên lịch: về hôm nay, xem tuần, xem tháng |
+| `←` `→` `↑` `↓` | Trên Vạn niên: chuyển ngày, chuyển tuần |
 
 Bấm trực tiếp vào các thẻ số trên Tổng quan để mở danh sách tương ứng.
 
@@ -186,7 +239,8 @@ Số đo của app thật:
 |---|---:|---:|
 | Agent đang nghỉ | khoảng 1 MB vật lý (14 MB đã cấp phát) | 0,000% |
 | Agent khi có đồng hồ nổi hoặc thẻ nhắc | khoảng 12 MB | rất thấp |
-| Giao diện đang mở | khoảng 26 MB, tới 33 MB nếu đã vào mọi trang | dưới 0,6% |
+| Giao diện đang mở | khoảng 30 MB, tới 39 MB nếu đã vào mọi trang | dưới 0,6% |
+| Gửi bản tin Telegram | tiến trình riêng, sống vài giây rồi thoát | |
 | Mở giao diện từ khay | khoảng 270 ms | |
 | Hiện Quick Add | dưới 10 ms | |
 | Danh sách 5.000 task | 2,4 ms mỗi bước cuộn | |
@@ -203,6 +257,8 @@ Vài quyết định giữ app nhẹ:
 - Toast gọi thẳng WinRT qua ctypes: không cần thư viện toast, mỗi lần chỉ vài chục mili-giây
 - Hạ tần suất dò theme và DPI của CustomTkinter từ 33 và 10 lần/giây xuống 1 lần/giây
 - Chạy bằng `pythonw.exe` gốc, không qua launcher của venv, để không có thêm một tiến trình thừa
+- Agent không nạp thư viện mạng: bản tin Telegram được gửi bởi một tiến trình riêng, nên RAM của agent không đổi và lỗi mạng không làm nghẽn nhắc việc
+- Giao diện chỉ nạp thư viện mạng khi bạn bấm nút Telegram hoặc hỏi AI, thêm khoảng 4 MB
 
 **Vì sao nhắc việc dùng thẻ riêng thay vì nút trên toast?** Nút trên toast của app không đóng gói phải gọi về app qua một URI tuỳ chỉnh, và trên Windows 11 26H2 việc này bật hộp thoại "chọn ứng dụng để mở" ngay cả khi đã đăng ký đầy đủ. Thẻ do chính agent vẽ thì bấm là xử lý ngay trong tiến trình, không cần đăng ký gì thêm và không cướp focus của cửa sổ bạn đang làm việc. Toast vẫn được dùng cho tin chỉ cần đọc, như tóm tắt đầu ngày.
 
@@ -248,10 +304,17 @@ app local/
    ├─ integration.py       Registry: tự khởi động, đăng ký app
    ├─ agent.py             Tiến trình nền: khay, lịch nhắc, phím tắt
    ├─ popups.py            Quick Add, đồng hồ nổi, thẻ nhắc việc vẽ bằng GDI
+   ├─ lunar.py             Âm lịch: đổi ngày, can chi, tiết khí, ngày và giờ hoàng đạo
+   ├─ almanac.py           Ngày lễ dương lịch, âm lịch và tục ngữ
+   ├─ telegram.py          Bot Telegram: soạn bản tin, gửi, thử lại
+   ├─ ai.py                Tử vi: lời nhắc, gọi AI, bản luận mẫu
+   ├─ web.py               Phần mạng dùng chung
+   ├─ vault.py             Mã hoá token và API key bằng DPAPI
    └─ ui/
       ├─ app.py            Cửa sổ chính, điều hướng, nhịp 1 giây
       ├─ pages.py          Trang Tổng quan, danh sách, Cài đặt
       ├─ calendar.py       Lịch tuần và tháng, kéo-thả
+      ├─ almanac_page.py   Trang Vạn niên và Tử vi
       ├─ editor.py         Panel chi tiết task, tự lưu
       ├─ widgets.py        Danh sách ảo, biểu đồ, chọn tag, lịch chọn ngày
       └─ theme.py          Màu sắc, font, icon
@@ -269,6 +332,7 @@ Hai tiến trình dùng chung một file SQLite ở chế độ WAL nên không 
 | Sao lưu tự động | `%LOCALAPPDATA%\TodoLite\backups\`, mỗi ngày một bản, giữ 7 bản gần nhất |
 | Sao lưu trước nâng cấp | `backups\before-schema-N.db`, tạo tự động trước khi đổi cấu trúc dữ liệu |
 | Nhật ký lỗi | `%LOCALAPPDATA%\TodoLite\app.log` |
+| Bot Token, API key | Trong `todo.db`, đã mã hoá bằng DPAPI theo tài khoản Windows |
 
 **Khôi phục từ bản sao lưu:** thoát app, chép bản muốn dùng trong `backups\` đè lên `todo.db`, xoá `todo.db-wal` và `todo.db-shm` nếu có, rồi mở lại. Vào **Cài đặt → Mở thư mục** để tới nhanh.
 
@@ -284,15 +348,22 @@ Hai tiến trình dùng chung một file SQLite ở chế độ WAL nên không 
 | `Ctrl+Alt+T` không hoạt động | Một ứng dụng khác đang chiếm phím; xem `app.log` |
 | Không tự khởi động sau khi đổi Python hoặc chuyển thư mục | Chạy lại `setup.bat` |
 | App không mở được | Xem `app.log`, hoặc chạy `python run.pyw --ui` trong terminal để thấy lỗi |
+| Không nhận được bản tin Telegram | Xem dòng trạng thái cuối mục **Cài đặt → Bot Telegram**, rồi bấm **Kiểm tra bot** và **Gửi thử** |
+| `Lấy tự động` báo chưa thấy tin nhắn | Nhắn `/start` cho bot ngay trước khi bấm, hoặc tự nhập Chat ID |
+| Bot báo đang dùng webhook | Bot đang nối với chương trình khác, hãy tự nhập Chat ID |
+| Tử vi báo sai model | Dịch vụ AI đã đổi tên model; sửa ô **Model** theo tài liệu của dịch vụ |
+| Token mất tác dụng sau khi đổi máy hoặc tài khoản Windows | DPAPI gắn với tài khoản Windows, hãy nhập lại |
 
 ---
 
 ## 8. Kiểm thử
 
-Bộ test chỉ dùng thư viện chuẩn, không đụng tới dữ liệu thật:
+Bộ test chỉ dùng thư viện chuẩn, không đụng tới dữ liệu thật và không gọi mạng ra ngoài: Telegram và AI được thử trên máy chủ giả chạy cục bộ.
 
 ```bash
 python -m unittest discover -s tests -t .
 ```
+
+Âm lịch được đối chiếu với dữ liệu độc lập: 72.684 ngày từ 1901 đến 2099 so với bảng lịch Trung Quốc của thư viện `lunardate`, và các ngày công bố trên baohatinh.vn, xemlicham.com, ngaydep.com. Chênh lệch với bảng Trung Quốc đến từ múi giờ UTC+7 so với UTC+8, đúng như các trường hợp đã biết là Tết 2007 và Tết 1985. Bài kiểm tra chỉ dùng để phát triển nên `lunardate` không nằm trong `requirements.txt`.
 
 Muốn chạy thử trên dữ liệu riêng, đặt biến môi trường `TODOLITE_DATA` trỏ tới một thư mục khác trước khi mở app. Ở chế độ này app cũng không đụng tới tự khởi động và các đăng ký hệ thống.

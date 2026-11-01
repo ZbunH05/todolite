@@ -13,6 +13,7 @@ from customtkinter.windows.widgets.appearance_mode.appearance_mode_tracker impor
 from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
 
 from ..db import task_tag_names
+from ..lunar import lunar_label
 from ..quickparse import parse
 from ..schedule import (ALL_DAY_TIME, WEEKDAY_SHORT, arrange_overlaps, calendar_items, days_in_month, from_text, month_days, to_text,
                         week_start)
@@ -36,7 +37,7 @@ Hit = namedtuple("Hit", "x0 y0 x1 y1 zone item day")  # zone: item | resize | mo
 FONTS = {"chip": ("FONT_TEXT", 12, 0), "chip_done": ("FONT_TEXT", 12, 1), "day": ("FONT_SEMIBOLD", 13, 0), "head": ("FONT_SEMIBOLD", 12, 0),
          "small": ("FONT_TEXT", 11, 0), "event": ("FONT_SEMIBOLD", 12, 0), "event_done": ("FONT_SEMIBOLD", 12, 1),
          "date": ("FONT_DISPLAY", 18, 0), "badge": ("FONT_ICON", 27, 0), "badge_big": ("FONT_ICON", 32, 0), "glyph": ("FONT_ICON", 10, 0),
-         "mark": ("FONT_ICON", 8, 0)}
+         "mark": ("FONT_ICON", 8, 0), "lunar": ("FONT_TEXT", 11, 0)}
 
 
 def snap(minutes):
@@ -45,6 +46,20 @@ def snap(minutes):
 
 def minutes_of(moment):
     return moment.hour * 60 + moment.minute
+
+
+def add_on_day(app, content, day, minutes=None, tag_name=""):
+    """Thêm việc vào một ngày. Câu gõ vào được hiểu theo chính ngày đó: '14h' là 14:00 của ngày vừa chọn."""
+    fields = parse(content, datetime.combine(day, time.min))
+    if not fields["due_at"]:
+        if minutes is None:
+            fields["due_at"], fields["all_day"] = f"{day.isoformat()} {ALL_DAY_TIME}", 1
+        else:
+            fields["due_at"] = to_text(datetime.combine(day, time.min) + timedelta(minutes=minutes))
+    if tag_name:
+        fields["tags"] = [*fields["tags"], tag_name]
+    app.store.add_task(fields.pop("title"), **fields)
+    app.changed()
 
 
 class CalendarBoard(tk.Canvas):
@@ -192,6 +207,7 @@ class CalendarBoard(tk.Canvas):
         else:
             color = self.colors["text"] if day.month == self.anchor.month else self.colors["muted"]
         self.create_text(number_x, number_y, text=str(day.day), font=self.fonts.get("day"), fill=color)
+        self._paint_lunar(x0 + cell_w - self._scaled(7), number_y, day, "e")
         chip_h, gap = self._scaled(CHIP_HEIGHT), self._scaled(CHIP_GAP)
         top = y0 + self._scaled(DAY_NUMBER)
         capacity = max(int((cell_h - self._scaled(DAY_NUMBER) - gap) // (chip_h + gap)), 0)
@@ -208,6 +224,11 @@ class CalendarBoard(tk.Canvas):
             self.create_text(x + self._scaled(6), y + chip_h / 2, text=label, anchor="w", font=self.fonts.get("small"),
                              fill=self.colors["accent"])
             self.hits.append(Hit(x, y, x + chip_w, y + chip_h, "more", None, day))
+
+    def _paint_lunar(self, x, y, day, anchor):
+        """Ngày âm nhỏ cạnh ngày dương. Mùng một ghi cả tháng và đổi màu cho dễ thấy."""
+        label = lunar_label(day)
+        self.create_text(x, y, text=label, anchor=anchor, font=self.fonts.get("lunar"), fill=self.colors["accent" if "/" in label else "muted"])
 
     @staticmethod
     def _one_per_task(items):
@@ -339,6 +360,7 @@ class CalendarBoard(tk.Canvas):
                 self.create_text(middle, head * 0.66, text=Icon.DOT, font=self.fonts.get("badge_big"), fill=self.colors["fill"])
             self.create_text(middle, head * 0.66, text=str(day.day), font=self.fonts.get("date"),
                              fill=self.colors["on_fill"] if day == today else self.colors["text"])
+            self._paint_lunar(middle + self._scaled(21), head * 0.66, day, "w")
             self.hits.append(Hit(x, head, x + column_w, top, "band", None, day))
             self._paint_band_cell(x, head, column_w, whole_day[day], rows, day)
         self.create_line(0, head, width, head, fill=self.colors["border"])
@@ -677,20 +699,7 @@ class CalendarPage(ctk.CTkFrame):
         label = f"{WEEKDAY_SHORT[day.weekday()]} {day:%d/%m}"
         if minutes is not None:
             label += f", {minutes // 60:02d}:{minutes % 60:02d}"
-        self.popover = QuickPopover(self.board, *position, label, lambda content: self._create(content, day, minutes))
-
-    def _create(self, content, day, minutes):
-        """Câu gõ vào được hiểu theo ngày vừa bấm: '14h' là 14:00 của chính ngày đó."""
-        fields = parse(content, datetime.combine(day, time.min))
-        if not fields["due_at"]:
-            if minutes is None:
-                fields["due_at"], fields["all_day"] = f"{day.isoformat()} {ALL_DAY_TIME}", 1
-            else:
-                fields["due_at"] = to_text(datetime.combine(day, time.min) + timedelta(minutes=minutes))
-        if self.tag_name:
-            fields["tags"] = [*fields["tags"], self.tag_name]
-        self.store.add_task(fields.pop("title"), **fields)
-        self.app.changed()
+        self.popover = QuickPopover(self.board, *position, label, lambda content: add_on_day(self.app, content, day, minutes, self.tag_name))
 
     def apply_drop(self, item, zone, target):
         task = item.task

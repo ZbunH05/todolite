@@ -63,6 +63,7 @@ class Icon:
     CHECKLIST = ""
     WARNING = ""
     CHART = ""
+    MOON = "\ue708"
 
 
 FONT_TEXT = "Segoe UI"

@@ -237,6 +237,25 @@ def summary_message(overdue, today, now):
     return " · ".join(parts), lines
 
 
+BRIEF_SETTINGS = ("telegram_enabled", "telegram_token", "telegram_chat_id", "telegram_time", "telegram_on_start",
+                  "telegram_last_sent", "telegram_failed_on")
+
+
+def brief_due(settings, now, started_today):
+    """Có cần gửi bản tin Telegram lúc này không.
+
+    Mỗi ngày một lần, tính theo mốc tới trước: lúc app khởi động lần đầu trong ngày, hoặc giờ đã đặt.
+    started_today nghĩa là app khởi động hôm nay; nhờ đó nếu lúc mới bật PC chưa có mạng,
+    các lần thử sau vẫn tiếp tục thay vì phải đợi tới giờ đã đặt.
+    """
+    if settings["telegram_enabled"] != "1" or not settings["telegram_token"] or not settings["telegram_chat_id"]:
+        return False
+    today = now.date().isoformat()
+    if today in (settings["telegram_last_sent"], settings["telegram_failed_on"]):
+        return False
+    return (started_today and settings["telegram_on_start"] == "1") or f"{now:%H:%M}" >= settings["telegram_time"]
+
+
 # ---------- Lịch tuần và tháng ----------
 
 CalendarItem = namedtuple("CalendarItem", "task start end all_day kind copy")  # copy: lần lặp tương lai, chưa có dòng riêng

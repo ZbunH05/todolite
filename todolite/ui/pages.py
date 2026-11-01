@@ -1,12 +1,15 @@
 """Ba trang của ứng dụng: Tổng quan, danh sách task, cài đặt."""
 import os
+import threading
 from datetime import datetime, timedelta
+from queue import SimpleQueue
 
 import customtkinter as ctk
 from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
 
 from .. import APP_NAME, __version__, integration
-from ..db import TAG_COLORS
+from ..db import DEFAULT_SETTINGS, TAG_COLORS
+from ..lunar import lunar_text, solar_to_lunar
 from ..paths import DATA_DIR
 from ..schedule import REMIND_CHOICES, WEEKDAY_LONG, active_block, block_window, countdown, from_text, humanize, next_block, parse_offsets
 from ..win32 import WM_APP_SUMMARY, post_agent
@@ -21,6 +24,8 @@ EMPTY_TEXTS = {"today": "Hôm nay chưa có việc nào.\nGõ vào ô phía trê
                "done": "Chưa hoàn thành việc nào."}
 GREETING_HOURS = ((5, "Khuya rồi"), (11, "Chào buổi sáng"), (13, "Chào buổi trưa"), (18, "Chào buổi chiều"), (22, "Chào buổi tối"))
 MAX_BLOCK_LINES = 5
+LONG_FIELD_WIDTH = 300
+SAVED_HINT = "Đã lưu, nhập để thay"
 
 
 def greeting(hour):
@@ -262,7 +267,7 @@ class Dashboard(ctk.CTkFrame):
     def refresh(self, now):
         stats = self.store.stats(now)
         self.hello.configure(text=greeting(now.hour))
-        self.today_label.configure(text=f"{WEEKDAY_LONG[now.weekday()]}, {now:%d/%m/%Y}")
+        self.today_label.configure(text=f"{WEEKDAY_LONG[now.weekday()]}, {now:%d/%m/%Y} · {lunar_text(solar_to_lunar(now.date()))} âm lịch")
         self.today_card.show(stats["today_open"], f"còn lại · {stats['done_today']} đã xong")
         overdue = stats["overdue"]
         self.overdue_card.show(overdue, "cần xử lý ngay" if overdue else "Không có việc trễ", RED if overdue else GREEN)
@@ -376,6 +381,7 @@ class SettingsPage(ctk.CTkFrame):
         super().__init__(master, fg_color=BG)
         self.app = app
         self.store = app.store
+        self.brief_status_shown = None
         ctk.CTkLabel(self, text="Cài đặt", font=theme.display(25), text_color=TEXT, anchor="w", height=34).pack(
             fill="x", padx=24, pady=(18, 10))
         scroll = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=TRACK,
@@ -411,8 +417,8 @@ class SettingsPage(ctk.CTkFrame):
         self.summary_time = field(row, width=76, justify="center")
         set_text(self.summary_time, self.store.setting("summary_time"))
         self.summary_time.pack(side="right")
-        self.summary_time.bind("<FocusOut>", self._save_summary_time)
-        self.summary_time.bind("<Return>", self._save_summary_time)
+        self.summary_time.bind("<FocusOut>", lambda _: self._save_time(self.summary_time, "summary_time"))
+        self.summary_time.bind("<Return>", lambda _: self._save_time(self.summary_time, "summary_time"))
         row = self._row(section, "Nhắc trước hạn mặc định", "Áp dụng cho việc tạo mới")
         self.remind_chips = {}
         chosen = parse_offsets(self.store.setting("default_remind"))
@@ -424,11 +430,61 @@ class SettingsPage(ctk.CTkFrame):
         row = self._row(section, "Gửi tóm tắt ngay", "Dùng để kiểm tra thông báo Windows có bị chặn không")
         secondary_button(row, "Gửi thử", lambda: post_agent(WM_APP_SUMMARY), width=84).pack(side="right")
 
+        self._build_telegram()
+        self._build_ai()
+
         section = self._section("Dữ liệu")
         row = self._row(section, "Thư mục dữ liệu", DATA_DIR if len(DATA_DIR) <= 72 else "…" + DATA_DIR[-71:])
         secondary_button(row, "Mở thư mục", lambda: os.startfile(DATA_DIR), width=104).pack(side="right")
         ctk.CTkLabel(scroll, text=f"{APP_NAME} {__version__}", font=theme.text(12), text_color=MUTED, anchor="w").pack(
             fill="x", padx=8, pady=(10, 0))
+
+    def _build_telegram(self):
+        store = self.store
+        section = self._section("Bot Telegram")
+        row = self._row(section, "Bản tin mỗi ngày", "Thần tâu lên hoàng thượng qua Telegram, mỗi ngày một lần")
+        self._switch(row, store.setting("telegram_enabled") == "1", self._set_brief_enabled)
+        row = self._row(section, "Bot Token", "Nhắn @BotFather để tạo bot. Token được mã hoá trên máy này")
+        self._secret_field(row, "telegram_token", "123456:ABC-DEF…")
+        row = self._row(section, "Chat ID", "Nhắn /start cho bot rồi bấm Lấy tự động")
+        self.chat_button = secondary_button(row, "Lấy tự động", self._fetch_chat, width=96)
+        self.chat_button.pack(side="right", padx=(8, 0))
+        self.chat_id = field(row, width=LONG_FIELD_WIDTH - 104, justify="center")
+        set_text(self.chat_id, store.setting("telegram_chat_id"))
+        self.chat_id.pack(side="right")
+        self.chat_id.bind("<FocusOut>", self._save_chat_id)
+        self.chat_id.bind("<Return>", self._save_chat_id)
+        row = self._row(section, "API URL", "Chỉ đổi khi dùng máy chủ riêng hoặc proxy")
+        self._url_field(row, "telegram_api_url")
+        row = self._row(section, "Giờ gửi", "Dành cho PC bật xuyên đêm, định dạng HH:MM")
+        self.brief_time = field(row, width=76, justify="center")
+        set_text(self.brief_time, store.setting("telegram_time"))
+        self.brief_time.pack(side="right")
+        self.brief_time.bind("<FocusOut>", lambda _: self._save_time(self.brief_time, "telegram_time"))
+        self.brief_time.bind("<Return>", lambda _: self._save_time(self.brief_time, "telegram_time"))
+        row = self._row(section, "Gửi khi PC bật lần đầu trong ngày", "Tắt đi thì chỉ gửi đúng giờ đã đặt")
+        self._switch(row, store.setting("telegram_on_start") == "1", lambda on: self._set_flag("telegram_on_start", on))
+        row = self._row(section, "Kiểm tra", "Gửi thử sẽ gửi đúng bản tin của hôm nay")
+        self.send_button = secondary_button(row, "Gửi thử", self._send_test, width=84)
+        self.send_button.pack(side="right")
+        self.check_button = secondary_button(row, "Kiểm tra bot", self._check_bot, width=104)
+        self.check_button.pack(side="right", padx=(0, 6))
+        self.brief_status = ctk.CTkLabel(section, text="", font=theme.text(12), text_color=MUTED, anchor="w", justify="left", wraplength=620)
+        self.brief_status.pack(fill="x", padx=16, pady=(0, 10))
+        self.refresh(None)
+
+    def _build_ai(self):
+        section = self._section("AI cho trang Tử vi")
+        row = self._row(section, "API key", "Không bắt buộc: chưa có key thì Tử vi luận mẫu ngay trên máy")
+        self._secret_field(row, "ai_key", "sk-…")
+        row = self._row(section, "API URL", "Dịch vụ bất kỳ theo chuẩn OpenAI, mặc định là DeepSeek")
+        self._url_field(row, "ai_url")
+        row = self._row(section, "Model", "Tên model của dịch vụ đang dùng")
+        self.ai_model = field(row, width=LONG_FIELD_WIDTH)
+        set_text(self.ai_model, self.store.setting("ai_model"))
+        self.ai_model.pack(side="right")
+        self.ai_model.bind("<FocusOut>", self._save_ai_model)
+        self.ai_model.bind("<Return>", self._save_ai_model)
 
     def _section(self, title):
         ctk.CTkLabel(self.scroll, text=title, font=theme.semibold(15), text_color=TEXT, anchor="w", height=24).pack(
@@ -522,15 +578,16 @@ class SettingsPage(ctk.CTkFrame):
         self.store.set_setting(key, "1" if enabled else "0")
         self.app.changed()
 
-    def _save_summary_time(self, _event=None):
-        value = self.summary_time.get().strip()
+    def _save_time(self, entry, key):
+        value = entry.get().strip()
         parts = value.split(":")
         valid = len(parts) == 2 and all(p.isdigit() for p in parts) and int(parts[0]) < 24 and int(parts[1]) < 60
-        self.summary_time.configure(border_color=BORDER if valid else RED)
+        entry.configure(border_color=BORDER if valid else RED)
         if valid:
             normalized = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
-            if normalized != self.store.setting("summary_time"):
-                self.store.set_setting("summary_time", normalized)
+            set_text(entry, normalized)
+            if normalized != self.store.setting(key):
+                self.store.set_setting(key, normalized)
                 self.app.changed()
 
     def _toggle_remind(self, minutes):
@@ -538,3 +595,152 @@ class SettingsPage(ctk.CTkFrame):
         chip.set_active(not chip.active)
         chosen = [str(value) for value in REMIND_CHOICES if self.remind_chips[value].active]
         self.store.set_setting("default_remind", ",".join(reversed(chosen)))
+
+    # ---------- Bot Telegram và AI ----------
+
+    def refresh(self, _now):
+        status = self.store.setting("telegram_status")
+        if status != self.brief_status_shown:
+            self.brief_status_shown = status
+            self._show_brief_status(status or "Chưa gửi bản tin nào")
+
+    def _show_brief_status(self, text, color=MUTED):
+        self.brief_status.configure(text=text, text_color=color)
+
+    def _secret_field(self, row, key, hint):
+        """Ô nhập khoá bí mật: đã lưu thì không bao giờ hiện lại, chỉ có thể nhập đè hoặc xoá."""
+        entry = field(row, width=LONG_FIELD_WIDTH - 36, show="•", placeholder_text=SAVED_HINT if self.store.setting(key) else hint)
+
+        def save(_event=None):
+            value = entry.get().strip()
+            if value:
+                self._set_secret(key, value)
+                entry.configure(placeholder_text=SAVED_HINT)
+                set_text(entry, "")
+
+        def forget():
+            self._set_secret(key, "")
+            entry.configure(placeholder_text=hint)
+            set_text(entry, "")
+
+        IconButton(row, Icon.DELETE, forget, size=30).pack(side="right", padx=(6, 0))
+        entry.pack(side="right")
+        entry.bind("<FocusOut>", save)
+        entry.bind("<Return>", save)
+
+    def _url_field(self, row, key):
+        entry = field(row, width=LONG_FIELD_WIDTH)
+        set_text(entry, self.store.setting(key))
+        entry.pack(side="right")
+        entry.bind("<FocusOut>", lambda _: self._save_url(entry, key))
+        entry.bind("<Return>", lambda _: self._save_url(entry, key))
+
+    def _save_url(self, entry, key):
+        from ..web import ApiError, check_api_url
+        try:
+            value = check_api_url(entry.get() or DEFAULT_SETTINGS[key])
+        except ApiError:
+            entry.configure(border_color=RED)
+            return
+        entry.configure(border_color=BORDER)
+        set_text(entry, value)
+        if value != self.store.setting(key):
+            self.store.set_setting(key, value)
+            if key == "telegram_api_url":
+                self._brief_setup_changed(self._brief_ready())
+
+    def _save_ai_model(self, _event=None):
+        value = self.ai_model.get().strip() or DEFAULT_SETTINGS["ai_model"]
+        set_text(self.ai_model, value)
+        self.store.set_setting("ai_model", value)
+
+    def _set_secret(self, key, value):
+        ready = self._brief_ready()
+        self.store.set_secret(key, value)
+        if key == "telegram_token":
+            self._brief_setup_changed(ready)
+
+    def _brief_ready(self):
+        return self.store.setting("telegram_enabled") == "1" and all(self.store.setting(key) for key in ("telegram_token", "telegram_chat_id"))
+
+    def _brief_setup_changed(self, was_ready):
+        """Vừa cài xong mà đã quá giờ thì chưa bắn tin ngay: bản tin đầu đi vào ngày mai, muốn xem liền thì bấm Gửi thử."""
+        now = datetime.now()
+        self.store.set_setting("telegram_failed_on", "")
+        if self._brief_ready() and not was_ready and f"{now:%H:%M}" >= self.store.setting("telegram_time"):
+            self.store.set_setting("telegram_last_sent", now.date().isoformat())
+        self.app.changed()
+
+    def _set_brief_enabled(self, enabled):
+        ready = self._brief_ready()
+        self.store.set_setting("telegram_enabled", "1" if enabled else "0")
+        self._brief_setup_changed(ready)
+
+    def _save_chat_id(self, _event=None):
+        value = self.chat_id.get().strip()
+        if value != self.store.setting("telegram_chat_id"):
+            ready = self._brief_ready()
+            self.store.set_setting("telegram_chat_id", value)
+            self._brief_setup_changed(ready)
+
+    def _in_background(self, button, work, done):
+        """Gọi mạng ở luồng phụ để giao diện không đứng, xong thì trả kết quả về luồng giao diện."""
+        from ..web import ApiError
+        results = SimpleQueue()
+
+        def run():
+            try:
+                results.put((work(), None))
+            except ApiError as error:
+                results.put((None, str(error)))
+
+        def wait():
+            if results.empty():
+                self.after(100, wait)
+                return
+            button.configure(state="normal")
+            done(*results.get())
+
+        button.configure(state="disabled")
+        threading.Thread(target=run, daemon=True).start()
+        self.after(100, wait)
+
+    def _bot_maker(self):
+        """Hàm tạo Bot để gọi trong luồng phụ: khoá phải đọc từ luồng giao diện, nơi giữ kết nối SQLite."""
+        from ..telegram import Bot
+        token, url = self.store.secret("telegram_token"), self.store.setting("telegram_api_url")
+        return lambda: Bot(token, url)
+
+    def _check_bot(self):
+        make_bot = self._bot_maker()
+        self._show_brief_status("Đang kiểm tra…")
+        self._in_background(self.check_button, lambda: make_bot().me(), self._on_checked)
+
+    def _on_checked(self, name, error):
+        self._show_brief_status(f"Bot {name} đã sẵn sàng" if name else error, GREEN if name else RED)
+
+    def _send_test(self):
+        from ..telegram import build_brief
+        chat = self.store.setting("telegram_chat_id")
+        if not chat:
+            self._show_brief_status("Chưa có Chat ID", RED)
+            return
+        make_bot, content = self._bot_maker(), build_brief(self.store, datetime.now())
+        self._show_brief_status("Đang gửi…")
+        self._in_background(self.send_button, lambda: make_bot().send(chat, content), self._on_sent)
+
+    def _on_sent(self, message, error):
+        self._show_brief_status("Đã gửi thử, hãy xem trong Telegram" if message else error, GREEN if message else RED)
+
+    def _fetch_chat(self):
+        make_bot = self._bot_maker()
+        self._show_brief_status("Đang tìm tin nhắn gửi cho bot…")
+        self._in_background(self.chat_button, lambda: make_bot().latest_chat(), self._on_chat)
+
+    def _on_chat(self, chat, error):
+        if chat:
+            set_text(self.chat_id, chat[0])
+            self._save_chat_id()
+            self._show_brief_status(f"Đã lấy Chat ID của {chat[1] or chat[0]}", GREEN)
+        else:
+            self._show_brief_status(error or "Chưa thấy tin nhắn nào. Hãy nhắn /start cho bot rồi bấm lại", RED)

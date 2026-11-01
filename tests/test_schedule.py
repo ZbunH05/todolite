@@ -2,7 +2,7 @@ import unittest
 from datetime import date, datetime, timedelta
 
 from todolite import schedule
-from todolite.schedule import (CalendarItem, arrange_overlaps, calendar_items, collect, countdown, day_label, describe_event,
+from todolite.schedule import (CalendarItem, arrange_overlaps, brief_due, calendar_items, collect, countdown, day_label, describe_event,
                                humanize, month_days, next_occurrence, summary_message, task_events, week_start)
 
 NOW = datetime(2026, 10, 31, 10, 0)  # Thứ Bảy
@@ -200,6 +200,53 @@ class Overlaps(unittest.TestCase):
 
     def test_empty(self):
         self.assertEqual(arrange_overlaps([]), [])
+
+
+class Brief(unittest.TestCase):
+    MORNING = datetime(2026, 11, 2, 6, 0)
+    TIME = datetime(2026, 11, 2, 7, 30)
+    LATE = datetime(2026, 11, 2, 20, 0)
+
+    def settings(self, **changes):
+        base = {"telegram_enabled": "1", "telegram_token": "x", "telegram_chat_id": "1", "telegram_time": "07:30",
+                "telegram_on_start": "1", "telegram_last_sent": "2026-11-01", "telegram_failed_on": ""}
+        return base | changes
+
+    def test_first_start_of_the_day_sends_before_the_set_time(self):
+        self.assertTrue(brief_due(self.settings(), self.MORNING, True))
+
+    def test_waits_for_the_set_time_when_app_was_already_running(self):
+        self.assertFalse(brief_due(self.settings(), self.MORNING, False))
+        self.assertTrue(brief_due(self.settings(), self.TIME, False))
+
+    def test_only_once_a_day(self):
+        sent = self.settings(telegram_last_sent="2026-11-02")
+        self.assertFalse(brief_due(sent, self.MORNING, True))
+        self.assertFalse(brief_due(sent, self.LATE, True))
+
+    def test_starting_after_the_set_time_still_sends(self):
+        self.assertTrue(brief_due(self.settings(), self.LATE, True))
+
+    def test_on_start_can_be_turned_off(self):
+        off = self.settings(telegram_on_start="0")
+        self.assertFalse(brief_due(off, self.MORNING, True))
+        self.assertTrue(brief_due(off, self.TIME, True))
+
+    def test_custom_time(self):
+        custom = self.settings(telegram_time="06:00")
+        self.assertTrue(brief_due(custom, self.MORNING, False))
+
+    def test_needs_token_and_chat(self):
+        self.assertFalse(brief_due(self.settings(telegram_token=""), self.LATE, True))
+        self.assertFalse(brief_due(self.settings(telegram_chat_id=""), self.LATE, True))
+
+    def test_switch_off(self):
+        self.assertFalse(brief_due(self.settings(telegram_enabled="0"), self.LATE, True))
+
+    def test_configuration_error_waits_for_tomorrow(self):
+        failed = self.settings(telegram_failed_on="2026-11-02")
+        self.assertFalse(brief_due(failed, self.LATE, True))
+        self.assertTrue(brief_due(failed, datetime(2026, 11, 3, 7, 30), False))
 
 
 class Text(unittest.TestCase):

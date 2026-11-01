@@ -85,6 +85,19 @@ DEFAULT_SETTINGS = {
     "ui_request": "",
     "window": "",
     "calendar_mode": "month",    # week | month
+    "telegram_enabled": "1",     # chỉ có tác dụng khi đã nhập token và Chat ID
+    "telegram_token": "",        # đã mã hoá bằng DPAPI, xem vault.py
+    "telegram_chat_id": "",
+    "telegram_api_url": "https://api.telegram.org",
+    "telegram_time": "07:30",
+    "telegram_on_start": "1",    # gửi ngay khi PC bật lần đầu trong ngày
+    "telegram_last_sent": "",
+    "telegram_failed_on": "",
+    "telegram_status": "",
+    "ai_url": "https://api.deepseek.com/chat/completions",
+    "ai_key": "",                # đã mã hoá bằng DPAPI
+    "ai_model": "deepseek-flash",
+    "birth_date": "",
 }
 
 EDITABLE = frozenset(("title", "notes", "priority", "due_at", "all_day", "remind", "recur",
@@ -219,6 +232,16 @@ class Store:
     def set_setting(self, key, value):
         self.conn.execute("INSERT INTO settings(key, value) VALUES(?, ?) "
                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def secret(self, key):
+        """Đọc giá trị đã mã hoá. Agent chỉ cần biết có hay không nên không gọi hàm này."""
+        from .vault import unprotect
+        stored = self.setting(key)
+        return unprotect(stored) if stored else ""
+
+    def set_secret(self, key, value):
+        from .vault import protect
+        self.set_setting(key, protect(value) if value else "")
 
     def take_ui_request(self):
         request = self.setting("ui_request")

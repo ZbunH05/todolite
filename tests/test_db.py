@@ -433,6 +433,19 @@ class Settings(StoreCase):
         self.store.set_setting("theme", "light")
         self.assertEqual(self.store.setting("theme"), "light")
 
+    def test_secret_is_encrypted_at_rest(self):
+        self.store.set_secret("telegram_token", "123456:ABC-mã-bí-mật")
+        self.assertEqual(self.store.secret("telegram_token"), "123456:ABC-mã-bí-mật")
+        stored = self.store.setting("telegram_token")
+        self.assertNotIn("123456", stored)
+        self.assertNotIn("ABC", stored)
+
+    def test_empty_secret_stays_empty(self):
+        self.store.set_secret("telegram_token", "abc")
+        self.store.set_secret("telegram_token", "")
+        self.assertEqual(self.store.setting("telegram_token"), "")
+        self.assertEqual(self.store.secret("telegram_token"), "")
+
     def test_ui_request_is_consumed_once(self):
         self.store.set_setting("ui_request", "task:5")
         self.assertEqual(self.store.take_ui_request(), "task:5")

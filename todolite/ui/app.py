@@ -25,7 +25,12 @@ DEFAULT_SIZE = "1200x780"
 MIN_WIDTH, MIN_HEIGHT = 960, 640
 DWMWA_CAPTION_COLOR = 35
 GA_ROOT = 2
-SHORTCUT_PAGES = ("dashboard", "calendar", "today", "upcoming", "all", "done")
+SHORTCUT_PAGES = ("dashboard", "calendar", "almanac", "today", "upcoming", "all", "done")
+
+
+def almanac_page(master, app):
+    from .almanac_page import AlmanacPage  # nạp khi mở lần đầu để cửa sổ hiện nhanh hơn
+    return AlmanacPage(master, app)
 
 
 class NavItem(ctk.CTkFrame):
@@ -144,8 +149,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(brand, text=APP_NAME, font=theme.display(17), text_color=TEXT).pack(side="left", padx=(10, 0))
 
         self.nav = {}
-        items = (("dashboard", Icon.HOME, "Tổng quan"), ("calendar", Icon.CALENDAR, "Lịch"), ("today", Icon.TODAY, "Hôm nay"),
-                 ("upcoming", Icon.UPCOMING, "Sắp tới"), ("all", Icon.LIST, "Tất cả"), ("done", Icon.DONE, "Đã xong"))
+        items = (("dashboard", Icon.HOME, "Tổng quan"), ("calendar", Icon.CALENDAR, "Lịch"), ("almanac", Icon.MOON, "Vạn niên"),
+                 ("today", Icon.TODAY, "Hôm nay"), ("upcoming", Icon.UPCOMING, "Sắp tới"), ("all", Icon.LIST, "Tất cả"),
+                 ("done", Icon.DONE, "Đã xong"))
         for key, glyph, label in items:
             item = NavItem(side, glyph, label, lambda k=key: self.navigate(k))
             item.pack(fill="x", padx=10, pady=1)
@@ -190,7 +196,8 @@ class App(ctk.CTk):
     def _page(self, name):
         """Trang chỉ được dựng khi mở lần đầu, giúp cửa sổ hiện nhanh hơn."""
         if name not in self.pages:
-            factory = {"dashboard": Dashboard, "calendar": CalendarPage, "tasks": TasksPage, "settings": SettingsPage}[name]
+            factory = {"dashboard": Dashboard, "calendar": CalendarPage, "almanac": almanac_page, "tasks": TasksPage,
+                       "settings": SettingsPage}[name]
             self.pages[name] = factory(self.content, self)
             self.pages[name].grid(row=0, column=0, sticky="nsew")
         return self.pages[name]
@@ -199,7 +206,7 @@ class App(ctk.CTk):
         editor = self._open_editor()
         if editor:
             editor.flush()
-        if key in ("dashboard", "calendar", "settings"):
+        if key in ("dashboard", "calendar", "almanac", "settings"):
             page = self._page(key)
         else:
             page = self._page("tasks")

@@ -40,6 +40,9 @@ def main(argv):
             start_agent(autostarted=True, open_ui=False)
         elif command == "--ui":
             run_ui()
+        elif command == "--telegram":
+            from .telegram import main as send_telegram
+            send_telegram()
         elif command == "--quit":
             stop_agent()
         else:
