@@ -11,14 +11,22 @@ from datetime import datetime, timedelta
 from . import APP_ID, APP_NAME, integration, schedule, toast
 from .db import Store
 from .paths import ICON_ALERT_PATH, ICON_PATH, ROOT, RUN_SCRIPT, SANDBOX, log, pythonw
-from .popups import QuickAdd, ReminderCard, TimerPill
+from .popups import PillItem, QuickAdd, ReminderCard, TimerPill
+from .vault import unprotect
 from .win32 import *  # noqa: F403
 
 TIMER_TICK = 1
+TIMER_TRIM = 2
+TRIM_DELAY_MS = 1500  # lúc luồng nghe báo thì nó còn đang dựng kết nối, chạm lại vài MB; đợi nó nằm yên trong WinHTTP
 HOTKEY_QUICK_ADD = 1
 MAX_SLEEP = timedelta(minutes=5)  # lưới an toàn: agent vẫn tự rà soát định kỳ
 MAX_INDIVIDUAL_ALERTS = 3
 BRIEF_RETRY = timedelta(minutes=5)  # lỗi mạng thì thử lại sau chừng này
+REMIND_RETRY = timedelta(minutes=2)  # tiến trình gửi nhắc hạn chưa gửi được thì mở lại sau chừng này
+
+
+def _earliest(*moments):
+    return min((moment for moment in moments if moment), default=None)
 
 MENU_OPEN, MENU_QUICK_ADD, MENU_SUMMARY, MENU_AUTOSTART, MENU_QUIT = 1, 2, 3, 4, 5
 
@@ -37,6 +45,11 @@ class Agent:
         self.resumed = False
         self.brief_start_day = None  # ngày PC bật gần nhất, tính cả lúc mở nắp máy sau khi ngủ
         self.brief_spawned_at = None
+        self.remind_spawned_at = None
+        self.pomo_notice = self.store.setting("pomo_notice")  # thông báo chuyển phiên đã hiện; cái cũ từ lần chạy trước thì thôi
+        self.listener = None  # chỉ tạo khi cần: người không dùng bot không tốn gì cho phần mạng
+        self.listener_wanted = None
+        self.listener_problem = ""
         self._procedure = WNDPROC(self._window_proc)
         self.taskbar_created = RegisterWindowMessageW("TaskbarCreated")
 
@@ -81,6 +94,26 @@ class Agent:
         elif self.hotkey_on and not wanted:
             UnregisterHotKey(self.hwnd, HOTKEY_QUICK_ADD)
             self.hotkey_on = False
+
+    def _sync_listener(self, now):
+        """Nghe tin nhắn Telegram khi đã cài xong bot. So bản token đã mã hoá để khỏi giải mã ở mỗi lần tính lịch."""
+        token = self.store.setting("telegram_token")
+        ready = self.store.setting("telegram_inbox") == "1" and token and self.store.setting("telegram_chat_id")
+        wanted = (token, self.store.setting("telegram_api_url")) if ready else None
+        if wanted != self.listener_wanted:
+            self.listener_wanted = wanted
+            if wanted and not self.listener:
+                from .listener import Listener
+                self.listener = Listener(lambda: PostMessageW(self.hwnd, WM_APP_TRIM, 0, 0))
+            if wanted and not self.store.setting("telegram_inbox_since"):
+                self.store.set_setting("telegram_inbox_since", int(now.timestamp()))
+            if self.listener:
+                self.listener.listen((unprotect(token), wanted[1]) if wanted else None)
+        problem = self.listener.problem if self.listener else ""
+        if problem != self.listener_problem:
+            self.listener_problem = problem
+            if problem:
+                self.store.set_setting("telegram_status", f"{now:%H:%M %d/%m}: Chưa nhận được tin nhắn. {problem}")
 
     def report(self, error):
         import traceback
@@ -182,6 +215,10 @@ class Agent:
         self.store.set_setting("ui_request", f"task:{task_id}")
         self.open_ui()
 
+    def open_page(self, key):
+        self.store.set_setting("ui_request", f"page:{key}")
+        self.open_ui()
+
     # ---------- Lịch nhắc ----------
 
     def tick(self):
@@ -190,14 +227,18 @@ class Agent:
         upcoming = None
         try:
             self._sync_hotkey()
+            self._sync_listener(now)
             self._daily(now)
             late_limit = schedule.STARTUP_LATE_LIMIT if self.first_tick else schedule.LATE_LIMIT
             tasks = self.store.scheduled_tasks()
-            show, skip, upcoming = schedule.collect(tasks, self.store.sent_keys(), now, late_limit)
+            sent = self.store.sent_keys()
+            show, skip, upcoming = schedule.collect(tasks, sent, now, late_limit)
             block = schedule.active_block(tasks, now)
-            self.pill.sync(block)
+            pomo = self._pomodoro(now)
+            self.pill.sync(self._pill_item(block, pomo))
             self._notify(show, now)
             self.store.mark_sent(show + skip)
+            upcoming = _earliest(upcoming, self._telegram_reminders(tasks, sent, now), pomo and pomo.end)
             self.card.refresh(now)
             self._refresh_tray(now, block)
         except Exception as error:
@@ -205,8 +246,53 @@ class Agent:
         finally:
             self.first_tick = False
             self._arm_timer(now, upcoming)
-            if not (self.pill.block or self.card.queue or self.quick.hwnd):
-                K32EmptyWorkingSet(GetCurrentProcess())  # sắp ngủ lâu: trả RAM vật lý cho hệ thống
+            self.trim()
+
+    def trim(self):
+        if not (self.pill.item or self.card.queue or self.quick.hwnd):
+            K32EmptyWorkingSet(GetCurrentProcess())  # sắp ngủ lâu: trả RAM vật lý cho hệ thống
+
+    def _pomodoro(self, now):
+        """Hết phiên Pomodoro thì chuyển phiên, rồi báo lần chuyển mới nhất, kể cả lần do giao diện chuyển khi agent chưa kịp.
+        Trả về trạng thái nếu đồng hồ đang chạy."""
+        if not self.store.setting("pomo_end") and self.store.setting("pomo_notice") == self.pomo_notice:
+            return None  # không dùng Pomodoro thì không phải nạp module của nó
+        from . import pomodoro
+        pomodoro.complete_due(self.store, now)
+        notice = self.store.setting("pomo_notice")
+        if notice != self.pomo_notice:
+            self.pomo_notice = notice
+            _stamp, title, line = notice.split("|", 2)
+            self._toast(title, [line])
+        state = pomodoro.read(self.store)
+        return state if state.end else None
+
+    def _pill_item(self, block, pomo):
+        """Đồng hồ nổi đếm khối giờ đang chạy, không có khối nào thì đếm phiên Pomodoro."""
+        if block:
+            task, start, end = block
+            return PillItem("block", task["title"], start, end, task["block_start"], task["id"], False)
+        if not pomo:
+            return None
+        from . import pomodoro
+        task = self.store.get_task(pomo.task_id) if pomo.task_id and pomo.phase == pomodoro.FOCUS else None
+        title = pomodoro.PHASE_NAMES[pomo.phase] + (f" · {task['title']}" if task else "")
+        start = pomo.end - timedelta(minutes=pomodoro.minutes_of(pomodoro.config(self.store), pomo.phase))
+        return PillItem("pomo", title, start, pomo.end, schedule.to_text_seconds(pomo.end), pomo.task_id, pomo.phase != pomodoro.FOCUS)
+
+    def _telegram_reminders(self, tasks, sent, now):
+        """Nhắc trước hạn qua Telegram. Gửi ở tiến trình riêng như bản tin; trả về mốc nhắc kế tiếp để hẹn giờ thức."""
+        offsets = schedule.parse_offsets(self.store.setting("telegram_remind"))
+        if not offsets or not self.store.setting("telegram_token") or not self.store.setting("telegram_chat_id"):
+            return None
+        send, skip, upcoming = schedule.telegram_reminders(tasks, offsets, sent, now)
+        self.store.mark_sent(skip)
+        if not send:
+            return upcoming
+        if not self.remind_spawned_at or now - self.remind_spawned_at >= REMIND_RETRY:
+            self.remind_spawned_at = now
+            ShellExecuteW(None, "open", pythonw(), f'"{RUN_SCRIPT}" --telegram-remind', ROOT, SW_HIDE)
+        return _earliest(upcoming, now + REMIND_RETRY)  # quay lại xem tiến trình đã gửi được chưa
 
     def _summary_due(self, now):
         moment = self.store.setting("summary_time")
@@ -281,7 +367,7 @@ class Agent:
             moment = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
             if moment > now:
                 targets.append(moment)
-        if self.pill.block or self.card.queue:
+        if self.pill.item or self.card.queue:
             targets.append(now + timedelta(minutes=1))  # cập nhật đếm ngược trên tooltip và thẻ nhắc
         delay = (min(targets) - now).total_seconds()
         SetTimer(self.hwnd, TIMER_TICK, max(int(delay * 1000) + 50, 200), None)
@@ -299,6 +385,11 @@ class Agent:
         try:
             if message == WM_TIMER and wparam == TIMER_TICK:
                 self.tick()
+            elif message == WM_APP_TRIM:
+                SetTimer(self.hwnd, TIMER_TRIM, TRIM_DELAY_MS, None)  # timer chỉ đặt được từ luồng sở hữu cửa sổ
+            elif message == WM_TIMER and wparam == TIMER_TRIM:
+                KillTimer(self.hwnd, TIMER_TRIM)
+                self.trim()
             elif message == WM_APP_TRAY:
                 self._on_tray_event(wparam, lparam)
             elif message == WM_APP_DATA or message == WM_TIMECHANGE:

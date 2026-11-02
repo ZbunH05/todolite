@@ -1,4 +1,4 @@
-"""Dữ liệu lịch vạn niên: ngày lễ dương lịch, âm lịch và tục ngữ mỗi ngày."""
+"""Dữ liệu lịch vạn niên: ngày lễ dương lịch, âm lịch và câu của ngày."""
 from datetime import date, timedelta
 
 from .lunar import lunar_month_length, solar_to_lunar
@@ -22,24 +22,6 @@ LUNAR_EVENTS = {
     (15, 7): "Lễ Vu Lan", (15, 8): "Tết Trung thu", (9, 9): "Tết Trùng cửu", (10, 10): "Tết Thường tân",
     (15, 10): "Tết Hạ nguyên", (23, 12): "Tiễn Ông Công Ông Táo",
 }
-
-SAYINGS = (
-    "Có công mài sắt, có ngày nên kim.", "Không thầy đố mày làm nên.", "Học thầy không tày học bạn.",
-    "Đi một ngày đàng, học một sàng khôn.", "Uống nước nhớ nguồn.", "Ăn quả nhớ kẻ trồng cây.",
-    "Tốt gỗ hơn tốt nước sơn.", "Một cây làm chẳng nên non, ba cây chụm lại nên hòn núi cao.",
-    "Thất bại là mẹ thành công.", "Có chí thì nên.", "Lửa thử vàng, gian nan thử sức.",
-    "Gần mực thì đen, gần đèn thì rạng.", "Một giọt máu đào hơn ao nước lã.", "Bán anh em xa, mua láng giềng gần.",
-    "Ăn vóc học hay.", "Cần cù bù thông minh.", "Tích tiểu thành đại.", "Năng nhặt chặt bị.",
-    "Kiến tha lâu cũng đầy tổ.", "Nước chảy đá mòn.", "Có kiêng có lành.", "Của bền tại người.",
-    "Đói cho sạch, rách cho thơm.", "Giấy rách phải giữ lấy lề.", "Lời nói chẳng mất tiền mua, lựa lời mà nói cho vừa lòng nhau.",
-    "Học ăn, học nói, học gói, học mở.", "Ở hiền gặp lành.", "Trăm hay không bằng tay quen.",
-    "Một nghề cho chín còn hơn chín nghề.", "Chớ thấy sóng cả mà ngã tay chèo.", "Thua keo này, bày keo khác.",
-    "Có đi có lại mới toại lòng nhau.", "Một miếng khi đói bằng một gói khi no.", "Lá lành đùm lá rách.",
-    "Nhiễu điều phủ lấy giá gương, người trong một nước phải thương nhau cùng.", "Tiên học lễ, hậu học văn.",
-    "Tay làm hàm nhai, tay quai miệng trễ.", "Việc hôm nay chớ để ngày mai.", "Đường đi khó không khó vì ngăn sông cách núi.",
-    "Không có việc gì khó, chỉ sợ lòng không bền.",
-)
-
 
 def _nth_sunday(year, month, nth):
     first = date(year, month, 1)
@@ -73,5 +55,7 @@ def month_events(year, month):
     return events
 
 
-def daily_saying(day):
-    return SAYINGS[day.toordinal() % len(SAYINGS)]
+def daily_sayings(day):
+    """Hai câu của ngày. Kho câu chỉ nạp khi cần để tiến trình không tốn RAM oan."""
+    from .sayings import for_day
+    return for_day(day)

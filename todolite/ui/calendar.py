@@ -18,14 +18,15 @@ from ..quickparse import parse
 from ..schedule import (ALL_DAY_TIME, WEEKDAY_SHORT, arrange_overlaps, calendar_items, days_in_month, from_text, month_days, to_text,
                         week_start)
 from ..win32 import set_window_rounded
-from . import theme
+from . import motion, theme
 from .editor import TaskEditor
-from .theme import (ACCENT, BG, BORDER, CARD, CARD_HOVER, FILL, GREEN, Icon, MUTED, ON_FILL, RED, SIDEBAR, TEXT, blend, resolve, tag_edge)
-from .widgets import Card, Chip, FontCache, IconButton, TagChip, field, secondary_button, segmented
+from .shapes import frame, rounded
+from .theme import (ACCENT, BG, BORDER, CARD, CARD_HOVER, FILL, GREEN, Icon, MUTED, ON_FILL, RED, SUNKEN, TEXT, blend, resolve, tag_edge)
+from .widgets import Label, Chip, FitLabel, FontCache, IconButton, Plain, TagChip, field, secondary_button, segmented
 
 MODES = {"Tuần": "week", "Tháng": "month"}
 LABELS = {mode: label for label, mode in MODES.items()}
-MONTH_HEAD, DAY_NUMBER, CHIP_HEIGHT, CHIP_GAP = 30, 30, 21, 2
+MONTH_HEAD, DAY_NUMBER, CHIP_HEIGHT, CHIP_GAP = 30, 30, 21, 3
 GUTTER, WEEK_HEAD, ALL_DAY_ROW, MAX_ALL_DAY_ROWS, HOUR_HEIGHT = 58, 62, 24, 3, 50
 SIDE_PANEL_MIN_WIDTH = 940  # hẹp hơn mức này thì panel chi tiết nổi đè lên lịch thay vì ép lịch co lại
 SNAP_MINUTES, MIN_EVENT_MINUTES, RESIZE_EDGE, DRAG_THRESHOLD = 15, 15, 7, 6
@@ -36,8 +37,7 @@ Hit = namedtuple("Hit", "x0 y0 x1 y1 zone item day")  # zone: item | resize | mo
 
 FONTS = {"chip": ("FONT_TEXT", 12, 0), "chip_done": ("FONT_TEXT", 12, 1), "day": ("FONT_SEMIBOLD", 13, 0), "head": ("FONT_SEMIBOLD", 12, 0),
          "small": ("FONT_TEXT", 11, 0), "event": ("FONT_SEMIBOLD", 12, 0), "event_done": ("FONT_SEMIBOLD", 12, 1),
-         "date": ("FONT_DISPLAY", 18, 0), "badge": ("FONT_ICON", 27, 0), "badge_big": ("FONT_ICON", 32, 0), "glyph": ("FONT_ICON", 10, 0),
-         "mark": ("FONT_ICON", 8, 0), "lunar": ("FONT_TEXT", 11, 0)}
+         "date": ("FONT_DISPLAY", 16, 0), "glyph": ("FONT_ICON", 10, 0), "mark": ("FONT_ICON", 8, 0), "lunar": ("FONT_TEXT", 11, 0)}
 
 
 def snap(minutes):
@@ -72,9 +72,11 @@ class CalendarBoard(tk.Canvas):
         self.anchor = date.today()
         self.items = []
         self.hits = []
+        self.scroll_hits = []  # vùng bấm của mục trong lưới giờ, ghi theo vị trí cuộn lúc vẽ
         self.hover = None
         self.selected_id = None
         self.scroll_y = None
+        self.painted_scroll = self.drawn_scroll = 0  # vị trí cuộn lúc vẽ và vị trí đang hiện sau các lần dời
         self.press = None
         self.drag = None
         self.grab_minutes = 0
@@ -84,6 +86,7 @@ class CalendarBoard(tk.Canvas):
         self.fonts = FontCache(FONTS)
         self.scale = 1.0
         self.colors = {}
+        self.corners = ()  # màu ngay trong bốn góc thẻ
         self.draw_pending = False
 
         self.bind("<Configure>", lambda _: self.schedule_draw())
@@ -92,7 +95,7 @@ class CalendarBoard(tk.Canvas):
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
-        self.bind("<MouseWheel>", self._on_wheel)
+        self.scroller = motion.Scroller(self, lambda: self.scroll_y or 0, self.set_scroll, self._scroll_extent)
         AppearanceModeTracker.add(lambda _mode: self._on_theme(), self)
 
     # ---------- Dữ liệu ----------
@@ -131,14 +134,16 @@ class CalendarBoard(tk.Canvas):
             return
         self.delete("all")
         self.hits = []
+        self.scroll_hits = []
         self.scale = ScalingTracker.get_widget_scaling(self)
         self.fonts.rescale(self.scale)
         self.colors = {name: resolve(pair) for name, pair in (
             ("card", CARD), ("hover", CARD_HOVER), ("border", BORDER), ("text", TEXT), ("muted", MUTED), ("accent", ACCENT),
-            ("fill", FILL), ("on_fill", ON_FILL), ("red", RED), ("green", GREEN), ("dim", SIDEBAR), ("bg", BG))}
+            ("fill", FILL), ("on_fill", ON_FILL), ("red", RED), ("green", GREEN), ("dim", SUNKEN), ("bg", BG))}
         width, height = self.winfo_width(), self.winfo_height()
         if width > 60 and height > 60:
             (self._paint_month if self.mode == "month" else self._paint_week)(width, height)
+            frame(self, width, height, self._scaled(theme.RADIUS_CARD), self.corners, self.colors["bg"], self.colors["border"])
 
     def _scaled(self, value):
         return round(value * self.scale)
@@ -150,11 +155,11 @@ class CalendarBoard(tk.Canvas):
             return resolve(tag_edge(self.app.tag_color(names[0])))
         return resolve(theme.PRIORITY_COLORS[item.task["priority"]] if item.task["priority"] else ACCENT)
 
-    def _paint_overdue_mark(self, x, y, item):
+    def _paint_overdue_mark(self, x, y, item, tags=()):
         """Chấm đỏ cho việc quá hạn: giữ nguyên màu tag để vẫn nhận ra việc thuộc nhóm nào."""
         task = item.task
         if not task["done_at"] and not item.copy and task["due_at"] and from_text(task["due_at"]) < datetime.now():
-            self.create_text(x, y, text=Icon.DOT, anchor="e", font=self.fonts.get("mark"), fill=self.colors["red"])
+            self.create_text(x, y, text=Icon.DOT, anchor="e", font=self.fonts.get("mark"), fill=self.colors["red"], tags=tags)
 
     def _fill_for(self, item, hovered):
         strength = 0.12 if item.task["done_at"] or item.copy else 0.26
@@ -182,27 +187,36 @@ class CalendarBoard(tk.Canvas):
         by_day = self._items_by_day()
         for index, day in enumerate(days):
             x0, y0 = index % 7 * cell_w, head + index // 7 * cell_h
-            x1, y1 = x0 + cell_w, y0 + cell_h
-            self.hits.append(Hit(x0, y0, x1, y1, "day", None, day))
-            if day == today:
-                self.create_rectangle(x0, y0, x1, y1, outline="", fill=blend(self.colors["fill"], self.colors["card"], 0.13))
-            elif day.month != self.anchor.month:
-                self.create_rectangle(x0, y0, x1, y1, outline="", fill=self.colors["dim"])
-            elif self.hover and self.hover.zone == "day" and self.hover.day == day:
-                self.create_rectangle(x0, y0, x1, y1, outline="", fill=self.colors["hover"])
-        for row in range(rows + 1):
+            self.hits.append(Hit(x0, y0, x0 + cell_w, y0 + cell_h, "day", None, day))
+            if day.month != self.anchor.month:
+                self.create_rectangle(x0, y0, x0 + cell_w, y0 + cell_h, outline="", fill=self.colors["dim"])
+        for row in range(rows):
             y = head + row * cell_h
             self.create_line(0, y, width, y, fill=self.colors["border"])
         for column in range(1, 7):
             self.create_line(column * cell_w, head, column * cell_w, height, fill=self.colors["border"])
+        inset, radius = self._scaled(2), self._scaled(theme.RADIUS_CONTROL)
         for index, day in enumerate(days):
             x0, y0 = index % 7 * cell_w, head + index // 7 * cell_h
-            self._paint_month_cell(day, x0, y0, cell_w, cell_h, by_day.get(day, []), today)
+            base = self._cell_color(day)
+            back = base
+            if day == today:
+                back = blend(self.colors["fill"], self.colors["card"], 0.13)
+            elif self.hover and self.hover.zone == "day" and self.hover.day == day:
+                back = self.colors["hover"]
+            if back != base:
+                rounded(self, x0 + inset, y0 + inset, x0 + cell_w - inset, y0 + cell_h - inset, radius, back, base, tags=("cell",))
+            self._paint_month_cell(day, x0, y0, cell_w, cell_h, by_day.get(day, []), today, back)
+        self.corners = (self.colors["card"], self.colors["card"], self._cell_color(days[-7]), self._cell_color(days[-1]))
 
-    def _paint_month_cell(self, day, x0, y0, cell_w, cell_h, items, today):
+    def _cell_color(self, day):
+        return self.colors["card"] if day.month == self.anchor.month else self.colors["dim"]
+
+    def _paint_month_cell(self, day, x0, y0, cell_w, cell_h, items, today, back):
         number_x, number_y = x0 + self._scaled(17), y0 + self._scaled(15)
         if day == today:
-            self.create_text(number_x, number_y, text=Icon.DOT, font=self.fonts.get("badge"), fill=self.colors["fill"])
+            badge = self._scaled(11)
+            rounded(self, number_x - badge, number_y - badge, number_x + badge, number_y + badge, badge, self.colors["fill"], back, tags=("cell",))
             color = self.colors["on_fill"]
         else:
             color = self.colors["text"] if day.month == self.anchor.month else self.colors["muted"]
@@ -216,14 +230,17 @@ class CalendarBoard(tk.Canvas):
         x = x0 + self._scaled(3)
         chip_w = cell_w - self._scaled(6)
         for offset, item in enumerate(shown):
-            self._paint_chip(x, top + offset * (chip_h + gap), chip_w, chip_h, item)
+            self._paint_chip(x, top + offset * (chip_h + gap), chip_w, chip_h, item, back)
         hidden = len(items) - len(shown)
         if hidden > 0:
-            y = top + len(shown) * (chip_h + gap)
-            label = f"+{hidden} việc nữa"
-            self.create_text(x + self._scaled(6), y + chip_h / 2, text=label, anchor="w", font=self.fonts.get("small"),
-                             fill=self.colors["accent"])
-            self.hits.append(Hit(x, y, x + chip_w, y + chip_h, "more", None, day))
+            self._paint_more(x, top + len(shown) * (chip_h + gap), chip_w, chip_h, hidden, day, back)
+
+    def _paint_more(self, x, y, width, height, hidden, day, back):
+        if self.hover and self.hover.zone == "more" and self.hover.day == day:
+            rounded(self, x, y, x + width, y + height, self._scaled(theme.RADIUS_CHIP), self.colors["hover"], back, tags=("chip",))
+        self.create_text(x + self._scaled(6), y + height / 2, text=f"+{hidden} việc nữa", anchor="w", font=self.fonts.get("small"),
+                         fill=self.colors["accent"])
+        self.hits.append(Hit(x, y, x + width, y + height, "more", None, day))
 
     def _paint_lunar(self, x, y, day, anchor):
         """Ngày âm nhỏ cạnh ngày dương. Mùng một ghi cả tháng và đổi màu cho dễ thấy."""
@@ -240,19 +257,18 @@ class CalendarBoard(tk.Canvas):
                 unique.append(item)
         return unique
 
-    def _paint_chip(self, x, y, width, height, item):
+    def _paint_chip(self, x, y, width, height, item, back):
         hovered = self._is_hovered(item)
         edge = self._edge(item)
-        self.create_rectangle(x, y, x + width, y + height, outline="", fill=self._fill_for(item, hovered))
-        self.create_rectangle(x, y, x + self._scaled(3), y + height, outline="", fill=edge)
-        if item.task["id"] == self.selected_id:
-            self.create_rectangle(x, y, x + width, y + height, outline=self.colors["accent"])
+        rounded(self, x, y, x + width, y + height, self._scaled(theme.RADIUS_CHIP), self._fill_for(item, hovered), back,
+                outline=self.colors["accent"] if item.task["id"] == self.selected_id else "", tags=("chip",))
+        self.create_text(x + self._scaled(5), y + height / 2, text=Icon.DOT, anchor="w", font=self.fonts.get("mark"), fill=edge)
         prefix = "" if item.all_day else f"{item.start:%H:%M} "
         font = "chip_done" if item.task["done_at"] else "chip"
-        room = width - self._scaled(20)
-        self.create_text(x + self._scaled(7), y + height / 2, anchor="w", font=self.fonts.get(font), fill=self._label_color(item),
+        room = width - self._scaled(26)
+        self.create_text(x + self._scaled(15), y + height / 2, anchor="w", font=self.fonts.get(font), fill=self._label_color(item),
                          text=self.fonts.fit(font, prefix + item.task["title"], room))
-        self._paint_overdue_mark(x + width - self._scaled(4), y + height / 2, item)
+        self._paint_overdue_mark(x + width - self._scaled(5), y + height / 2, item)
         self.hits.append(Hit(x, y, x + width, y + height, "item", item, item.start.date()))
 
     # ---------- Tuần ----------
@@ -270,81 +286,86 @@ class CalendarBoard(tk.Canvas):
         hour_h = self._scaled(HOUR_HEIGHT)
         limit = max(24 * hour_h - (height - top), 0)
         if self.scroll_y is None:
+            self.scroller.halt()  # tuần khác hoặc vừa đổi chế độ: không để lần trượt cũ ghi đè giờ mở đầu
             self.scroll_y = self._opening_scroll(hour_h)
         self.scroll_y = max(min(self.scroll_y, limit), 0)
+        self.painted_scroll = self.drawn_scroll = round(self.scroll_y)
         self.week_geometry = (gutter, top, column_w, hour_h)
         today = date.today()
         self._paint_hours(width, height, gutter, top, hour_h)
         for index, day in enumerate(days):
             x = gutter + index * column_w
+            back = self._column_color(day)
             self.hits.append(Hit(x, top, x + column_w, height, "slot", None, day))
             if day == today:
-                self.create_rectangle(x, top, x + column_w, height, outline="", fill=blend(self.colors["fill"], self.colors["card"], 0.10))
+                self.create_rectangle(x, top, x + column_w, height, outline="", fill=back)
                 self.tag_lower(self.find_all()[-1])
             self.create_line(x, top, x, height, fill=self.colors["border"])
-            self._paint_day_events(x, column_w, top, height, hour_h, [item for item in by_day.get(day, []) if not item.all_day])
+            self._paint_day_events(x, column_w, top, height, hour_h, [item for item in by_day.get(day, []) if not item.all_day], back)
         self._paint_now_line(days, gutter, column_w, top, hour_h, width)
         self._paint_week_head(days, whole_day, gutter, column_w, head, top, width, rows, today)
+        self.corners = (self.colors["card"], self.colors["card"], self.colors["card"], self._column_color(days[-1]))
+
+    def _column_color(self, day):
+        return blend(self.colors["fill"], self.colors["card"], 0.10) if day == date.today() else self.colors["card"]
 
     def _opening_scroll(self, hour_h):
         hour = datetime.now().hour - 1 if week_start(self.anchor) == week_start(date.today()) else FIRST_VISIBLE_HOUR
         return max(hour, 0) * hour_h
 
     def _paint_hours(self, width, height, gutter, top, hour_h):
+        """Lưới giờ vẽ đủ 24 giờ, kể cả phần khuất: cuộn chỉ dời các hình mang tag wk, phần trên đầu bảng che đi."""
         for hour in range(24):
-            y = top + hour * hour_h - self.scroll_y
-            if top - hour_h <= y <= height:
-                self.create_line(gutter, y, width, y, fill=self.colors["border"])
-                if hour:
-                    self.create_text(gutter - self._scaled(8), y, text=f"{hour:02d}:00", anchor="e", font=self.fonts.get("small"),
-                                     fill=self.colors["muted"])
+            y = top + hour * hour_h - self.painted_scroll
+            self.create_line(gutter, y, width, y, fill=self.colors["border"], tags="wk")
+            if hour:
+                self.create_text(gutter - self._scaled(8), y, text=f"{hour:02d}:00", anchor="e", font=self.fonts.get("small"),
+                                 fill=self.colors["muted"], tags="wk")
 
-    def _paint_day_events(self, x, column_w, top, height, hour_h, items):
+    def _paint_day_events(self, x, column_w, top, height, hour_h, items, back):
         pad = self._scaled(2)
         for item, column, columns in arrange_overlaps(items):
             start = minutes_of(item.start)
             end = MINUTES_PER_DAY if item.end.date() != item.start.date() else minutes_of(item.end)
-            y0 = top + start / 60 * hour_h - self.scroll_y
+            y0 = top + start / 60 * hour_h - self.painted_scroll
             y1 = y0 + max((end - start) / 60 * hour_h, self._scaled(22))
-            if y1 < top or y0 > height:
-                continue
             width = (column_w - 2 * pad) / columns
             left = x + pad + column * width
-            self._paint_event(left, y0 + 1, width - 1, y1 - y0 - 2, item)
+            self._paint_event(left, y0 + 1, width - 1, y1 - y0 - 2, item, back)
 
-    def _paint_event(self, x, y, width, height, item):
+    def _paint_event(self, x, y, width, height, item, back):
         hovered = self._is_hovered(item)
         edge = self._edge(item)
-        self.create_rectangle(x, y, x + width, y + height, outline="", fill=self._fill_for(item, hovered))
-        self.create_rectangle(x, y, x + self._scaled(3), y + height, outline="", fill=edge)
-        if item.task["id"] == self.selected_id:
-            self.create_rectangle(x, y, x + width, y + height, outline=self.colors["accent"])
+        rounded(self, x, y, x + width, y + height, self._scaled(theme.RADIUS_CHIP), self._fill_for(item, hovered), back,
+                outline=self.colors["accent"] if item.task["id"] == self.selected_id else "", tags=("chip", "wk"))
         font = "event_done" if item.task["done_at"] else "event"
-        room = width - self._scaled(20)
+        room = width - self._scaled(26)
         color = self._label_color(item)
-        self._paint_overdue_mark(x + width - self._scaled(4), y + self._scaled(11), item)
+        text_x = x + self._scaled(14)
+        self.create_text(x + self._scaled(5), y + self._scaled(13) if height >= self._scaled(40) else y + height / 2, text=Icon.DOT, anchor="w",
+                         font=self.fonts.get("mark"), fill=edge, tags="wk")
+        self._paint_overdue_mark(x + width - self._scaled(5), y + self._scaled(13), item, "wk")
         if height >= self._scaled(40):
-            self.create_text(x + self._scaled(7), y + self._scaled(4), anchor="nw", font=self.fonts.get(font), fill=color,
-                             text=self.fonts.fit(font, item.task["title"], room))
+            self.create_text(text_x, y + self._scaled(4), anchor="nw", font=self.fonts.get(font), fill=color,
+                             text=self.fonts.fit(font, item.task["title"], room), tags="wk")
             span = f"{item.start:%H:%M}–{item.end:%H:%M}" if item.kind == "block" else f"Hạn {item.start:%H:%M}"
-            self.create_text(x + self._scaled(7), y + self._scaled(22), anchor="nw", font=self.fonts.get("small"), fill=self.colors["muted"],
-                             text=self.fonts.fit("small", span, room))
+            self.create_text(text_x, y + self._scaled(22), anchor="nw", font=self.fonts.get("small"), fill=self.colors["muted"],
+                             text=self.fonts.fit("small", span, room), tags="wk")
         else:
-            self.create_text(x + self._scaled(7), y + height / 2, anchor="w", font=self.fonts.get(font), fill=color,
-                             text=self.fonts.fit(font, f"{item.start:%H:%M} {item.task['title']}", room))
-        self.hits.append(Hit(x, y, x + width, y + height, "item", item, item.start.date()))
+            self.create_text(text_x, y + height / 2, anchor="w", font=self.fonts.get(font), fill=color,
+                             text=self.fonts.fit(font, f"{item.start:%H:%M} {item.task['title']}", room), tags="wk")
+        self.scroll_hits.append(Hit(x, y, x + width, y + height, "item", item, item.start.date()))
         if not item.copy and not item.task["done_at"]:
-            self.hits.append(Hit(x, y + height - self._scaled(RESIZE_EDGE), x + width, y + height, "resize", item, item.start.date()))
+            self.scroll_hits.append(Hit(x, y + height - self._scaled(RESIZE_EDGE), x + width, y + height, "resize", item, item.start.date()))
 
     def _paint_now_line(self, days, gutter, column_w, top, hour_h, width):
         now = datetime.now()
         if now.date() not in days:
             return
-        y = top + minutes_of(now) / 60 * hour_h - self.scroll_y
-        if y >= top:
-            x = gutter + days.index(now.date()) * column_w
-            self.create_line(x, y, x + column_w, y, fill=self.colors["red"], width=self._scaled(2))
-            self.create_text(x, y, text=Icon.DOT, font=self.fonts.get("glyph"), fill=self.colors["red"])
+        y = top + minutes_of(now) / 60 * hour_h - self.painted_scroll
+        x = gutter + days.index(now.date()) * column_w
+        self.create_line(x, y, x + column_w, y, fill=self.colors["red"], width=self._scaled(2), tags="wk")
+        self.create_text(x, y, text=Icon.DOT, font=self.fonts.get("glyph"), fill=self.colors["red"], tags="wk")
 
     def _paint_week_head(self, days, whole_day, gutter, column_w, head, top, width, rows, today):
         self.create_rectangle(0, 0, width, top, outline="", fill=self.colors["card"])
@@ -357,7 +378,8 @@ class CalendarBoard(tk.Canvas):
             self.create_text(middle, head * 0.26, text=WEEKDAY_SHORT[day.weekday()], font=self.fonts.get("head"),
                              fill=self.colors["accent"] if day == today else self.colors["muted"])
             if day == today:
-                self.create_text(middle, head * 0.66, text=Icon.DOT, font=self.fonts.get("badge_big"), fill=self.colors["fill"])
+                badge = self._scaled(14)
+                rounded(self, middle - badge, head * 0.66 - badge, middle + badge, head * 0.66 + badge, badge, self.colors["fill"], self.colors["card"])
             self.create_text(middle, head * 0.66, text=str(day.day), font=self.fonts.get("date"),
                              fill=self.colors["on_fill"] if day == today else self.colors["text"])
             self._paint_lunar(middle + self._scaled(21), head * 0.66, day, "w")
@@ -375,7 +397,7 @@ class CalendarBoard(tk.Canvas):
         width = column_w - self._scaled(4)
         shown = items if len(items) <= rows else items[:rows - 1]
         for offset, item in enumerate(shown):
-            self._paint_chip(left, head + gap + offset * (chip_h + gap), width, chip_h, item)
+            self._paint_chip(left, head + gap + offset * (chip_h + gap), width, chip_h, item, self.colors["card"])
         if len(items) > len(shown):
             y = head + gap + len(shown) * (chip_h + gap)
             self.create_text(left + self._scaled(6), y + chip_h / 2, text=f"+{len(items) - len(shown)} việc nữa", anchor="w",
@@ -384,6 +406,11 @@ class CalendarBoard(tk.Canvas):
     # ---------- Tương tác ----------
 
     def _hit_at(self, x, y):
+        if self.mode == "week" and y >= self.week_geometry[1]:
+            moved = y + self.drawn_scroll - self.painted_scroll  # mục trong lưới giờ đã dời đi từ lúc vẽ
+            for hit in reversed(self.scroll_hits):
+                if hit.x0 <= x < hit.x1 and hit.y0 <= moved < hit.y1:
+                    return hit
         for hit in reversed(self.hits):
             if hit.x0 <= x < hit.x1 and hit.y0 <= y < hit.y1:
                 return hit
@@ -392,7 +419,7 @@ class CalendarBoard(tk.Canvas):
     def _set_hover(self, hit):
         before, self.hover = self.hover, hit
         same_item = (before and before.item and before.item.task["id"]) == (hit and hit.item and hit.item.task["id"])
-        same_day = (before and before.zone == "day" and before.day) == (hit and hit.zone == "day" and hit.day)
+        same_day = (before and before.zone in ("day", "more") and (before.zone, before.day)) == (hit and hit.zone in ("day", "more") and (hit.zone, hit.day))
         if not (same_item and same_day):
             self.schedule_draw()
 
@@ -402,10 +429,18 @@ class CalendarBoard(tk.Canvas):
         zone = hit.zone if hit else None
         self.configure(cursor={"resize": "sb_v_double_arrow", "item": "hand2", "more": "hand2", "day": "plus", "slot": "plus", "band": "plus"}.get(zone, ""))
 
-    def _on_wheel(self, event):
-        if self.mode == "week":
-            self.scroll_y = (self.scroll_y or 0) - event.delta / 120 * self.week_geometry[3]
-            self.schedule_draw()
+    def _scroll_extent(self):
+        _, top, _, hour_h = self.week_geometry
+        return (24 * hour_h, self.winfo_height() - top) if self.mode == "week" and hour_h else (0, 0)
+
+    def set_scroll(self, position):
+        """Cuộn lưới giờ, gọi ở từng khung hình: chỉ dời các hình đã vẽ, đầu bảng và khung thẻ đứng yên vì nằm trên cùng."""
+        self.scroll_y = position
+        shown = round(position)
+        if self.mode != "week" or self.draw_pending or self.drag or shown == self.drawn_scroll:
+            return
+        self.move("wk", 0, self.drawn_scroll - shown)
+        self.drawn_scroll = shown
 
     def _on_press(self, event):
         self.focus_set()
@@ -440,7 +475,7 @@ class CalendarBoard(tk.Canvas):
 
     def _pointer_minutes(self, y):
         _, top, _, hour_h = self.week_geometry
-        return (y - top + (self.scroll_y or 0)) / hour_h * 60
+        return (y - top + self.drawn_scroll) / hour_h * 60
 
     def _ghost_month(self, event):
         head, cell_w, cell_h = self.month_geometry
@@ -449,7 +484,10 @@ class CalendarBoard(tk.Canvas):
         row = max(min(int((event.y - head) // cell_h), len(days) // 7 - 1), 0)
         self.target = days[row * 7 + column]
         x, y = column * cell_w, head + row * cell_h
-        self.create_rectangle(x + 1, y + 1, x + cell_w - 1, y + cell_h - 1, outline=self.colors["accent"], width=self._scaled(2), tags="ghost")
+        self._ghost(x + 1, y + 1, x + cell_w - 1, y + cell_h - 1, self._cell_color(self.target))
+
+    def _ghost(self, x0, y0, x1, y1, back):
+        rounded(self, x0, y0, x1, y1, self._scaled(theme.RADIUS_CONTROL), "", back, outline=self.colors["accent"], width=self._scaled(2), tags=("ghost",))
 
     def _ghost_week(self, event, item):
         gutter, top, column_w, hour_h = self.week_geometry
@@ -458,15 +496,14 @@ class CalendarBoard(tk.Canvas):
         x = gutter + column * column_w
         if event.y < top:
             self.target = (day, None)
-            self.create_rectangle(x + 1, self._scaled(WEEK_HEAD) + 1, x + column_w - 1, top - 2, outline=self.colors["accent"],
-                                  width=self._scaled(2), tags="ghost")
+            self._ghost(x + 1, self._scaled(WEEK_HEAD) + 1, x + column_w - 1, top - 2, self.colors["card"])
             return
         start = snap(self._pointer_minutes(event.y) - self.grab_minutes)
         self.target = (day, start)
         span = 60 if item.all_day else max((item.end - item.start).total_seconds() / 60, MIN_EVENT_MINUTES)
-        y0 = top + start / 60 * hour_h - self.scroll_y
+        y0 = top + start / 60 * hour_h - self.drawn_scroll
         y1 = y0 + span / 60 * hour_h
-        self.create_rectangle(x + 2, y0, x + column_w - 2, y1, outline=self.colors["accent"], width=self._scaled(2), tags="ghost")
+        self._ghost(x + 2, y0, x + column_w - 2, y1, self._column_color(day))
         self.create_text(x + self._scaled(8), y0 + self._scaled(4), anchor="nw", text=f"{start // 60:02d}:{start % 60:02d}",
                          font=self.fonts.get("event"), fill=self.colors["accent"], tags="ghost")
 
@@ -477,9 +514,9 @@ class CalendarBoard(tk.Canvas):
         start = minutes_of(item.start)
         end = max(snap(self._pointer_minutes(event.y)), start + MIN_EVENT_MINUTES)
         self.target = end - start
-        y0 = top + start / 60 * hour_h - self.scroll_y
-        y1 = top + end / 60 * hour_h - self.scroll_y
-        self.create_rectangle(x + 2, y0, x + column_w - 2, y1, outline=self.colors["accent"], width=self._scaled(2), tags="ghost")
+        y0 = top + start / 60 * hour_h - self.drawn_scroll
+        y1 = top + end / 60 * hour_h - self.drawn_scroll
+        self._ghost(x + 2, y0, x + column_w - 2, y1, self._column_color(item.start.date()))
         self.create_text(x + self._scaled(8), y1 - self._scaled(4), anchor="sw", text=f"{self.target} phút", font=self.fonts.get("event"),
                          fill=self.colors["accent"], tags="ghost")
 
@@ -523,21 +560,21 @@ class QuickPopover(tk.Toplevel):
         self.attributes("-topmost", True)
         self.on_submit = on_submit
         scale = ScalingTracker.get_widget_scaling(master)
-        body = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0, border_width=1, border_color=ACCENT)
+        body = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0)
         body.pack(fill="both", expand=True)
-        ctk.CTkLabel(body, text=label, font=theme.semibold(12), text_color=ACCENT, anchor="w", height=20).pack(fill="x", padx=12, pady=(10, 2))
+        Label(body, text=label, font=theme.semibold(13), text_color=ACCENT, anchor="w", height=20).pack(fill="x", padx=12, pady=(10, 2))
         self.entry = field(body, width=self.WIDTH - 24, placeholder_text="Tên việc, Enter để lưu, Esc để đóng")
         self.entry.pack(padx=12, pady=(0, 12))
         self.entry.bind("<Return>", self._submit)
         self.entry.bind("<Escape>", lambda _: self.destroy())
         self.bind("<FocusOut>", lambda _: self.after(80, self._close_if_unfocused))
-        width, height = round(self.WIDTH * scale), round(92 * scale)
+        width, height = round(self.WIDTH * scale), round(86 * scale)
         x = min(x, master.winfo_screenwidth() - width - 8)
         y = min(y, master.winfo_screenheight() - height - 56)
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.deiconify()
         self.update_idletasks()
-        set_window_rounded(self.winfo_id())
+        set_window_rounded(self.winfo_id(), resolve(ACCENT))
         self.entry._entry.focus_force()
 
     def _close_if_unfocused(self):
@@ -566,30 +603,29 @@ class CalendarPage(ctk.CTkFrame):
         self.legend_signature = None
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
+        Plain(self, width=24, height=1).grid(row=0, column=2)  # lề phải giữ nguyên dù panel chi tiết đóng hay mở
 
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=(24, 12), pady=(18, 8))
+        header = Plain(self)
+        header.grid(row=0, column=0, sticky="ew", padx=(24, 0), pady=(18, 8))
         self.mode_switch = segmented(header, list(MODES), self.set_mode, width=132, dynamic_resizing=False)
         self.mode_switch.pack(side="right")  # xếp trước để không bị bóp khi thiếu chỗ
-        self.title_label = ctk.CTkLabel(header, text="", font=theme.display(25), text_color=TEXT, anchor="w", height=34)
+        self.title_label = Label(header, text="", font=theme.display(24), text_color=TEXT, anchor="w", height=36)
         self.title_label.pack(side="left")
         IconButton(header, Icon.LEFT, lambda: self.step(-1), size=32, color=TEXT).pack(side="left", padx=(12, 0))
         IconButton(header, Icon.RIGHT, lambda: self.step(1), size=32, color=TEXT).pack(side="left")
         secondary_button(header, "Hôm nay", self.go_today, width=76).pack(side="left", padx=(6, 0))
-        self.summary = ctk.CTkLabel(header, text="", font=theme.text(13), text_color=MUTED, height=34)
-        self.summary.pack(side="left", padx=(14, 0))
+        self.summary = FitLabel(header, separator=" · ", font=theme.text(13), text_color=MUTED, anchor="w", height=34)
+        self.summary.pack(side="left", fill="x", expand=True, padx=(14, 12))
 
-        legend_row = ctk.CTkFrame(self, fg_color="transparent", height=30)
-        legend_row.grid(row=1, column=0, sticky="ew", padx=(24, 12), pady=(0, 8))
-        self.legend = ctk.CTkFrame(legend_row, fg_color="transparent")
+        legend_row = Plain(self, height=30)
+        legend_row.grid(row=1, column=0, sticky="ew", padx=(24, 0), pady=(0, 8))
+        self.legend = Plain(legend_row)
         self.legend.pack(side="left")
-        self.hint = ctk.CTkLabel(legend_row, text="Bấm ô trống để thêm · kéo để dời lịch", font=theme.text(12), text_color=MUTED)
+        self.hint = Label(legend_row, text="Bấm ô trống để thêm · kéo để dời lịch", font=theme.text(12), text_color=MUTED)
         legend_row.bind("<Configure>", lambda _: self._fit_hint())
 
-        card = Card(self)
-        card.grid(row=2, column=0, sticky="nsew", padx=(24, 12), pady=(0, 20))
-        self.board = CalendarBoard(card, self)
-        self.board.pack(fill="both", expand=True, padx=2, pady=2)
+        self.board = CalendarBoard(self, self)
+        self.board.grid(row=2, column=0, sticky="nsew", padx=(24, 0), pady=(0, 20))
         self.board.mode = self.store.setting("calendar_mode")
         self.mode_switch.set(LABELS[self.board.mode])
         for key, action in (("<Left>", lambda: self.step(-1)), ("<Right>", lambda: self.step(1)), ("t", self.go_today),
@@ -602,10 +638,11 @@ class CalendarPage(ctk.CTkFrame):
         mode = MODES[label]
         self.mode_switch.set(label)
         if mode != self.board.mode:
-            self.board.mode = mode
-            self.board.scroll_y = None
-            self.store.set_setting("calendar_mode", mode)
-            self.refresh(datetime.now())
+            with self.app.fade():
+                self.board.mode = mode
+                self.board.scroll_y = None
+                self.store.set_setting("calendar_mode", mode)
+                self.refresh(datetime.now())
 
     def step(self, direction):
         anchor = self.board.anchor
@@ -657,7 +694,7 @@ class CalendarPage(ctk.CTkFrame):
             parts.append(f"{late} quá hạn")
         if finished:
             parts.append(f"{finished} đã xong")
-        self.summary.configure(text=" · ".join(parts))
+        self.summary.set_text(" · ".join(parts))
         self._render_legend()
 
     def _render_legend(self, force=False):
@@ -680,9 +717,10 @@ class CalendarPage(ctk.CTkFrame):
         """Dòng gợi ý chỉ hiện khi đủ chỗ, không để bị cắt giữa chừng."""
         row = self.hint.master
         fits = self.legend.winfo_reqwidth() + self.hint.winfo_reqwidth() + 24 <= row.winfo_width()
-        if fits and not self.hint.winfo_ismapped():
+        packed = bool(self.hint.winfo_manager())  # không dùng winfo_ismapped: đổi Cỡ chữ lúc trang đang ẩn thì nhãn đã xếp nhưng chưa hiện
+        if fits and not packed:
             self.hint.pack(side="right")
-        elif not fits and self.hint.winfo_ismapped():
+        elif not fits and packed:
             self.hint.pack_forget()
 
     # ---------- Thêm và dời việc ----------
@@ -740,11 +778,17 @@ class CalendarPage(ctk.CTkFrame):
     # ---------- Panel chi tiết ----------
 
     def open_editor(self, task_id):
+        """Mở panel thì cả vùng nội dung mờ dần, đổi việc khi panel đang mở thì chỉ panel mờ dần."""
+        opening = not self.editor_open
+        with self.app.fade(None if opening else self.editor, when=opening or task_id != self.editor.task_id):
+            self._open_editor(task_id)
+
+    def _open_editor(self, task_id):
         if self.editor is None:
             self.editor = TaskEditor(self, self.app)
         if not self.editor_open:
             room = self.winfo_width() / ScalingTracker.get_widget_scaling(self)
-            column, padding = (1, (0, 24)) if room >= SIDE_PANEL_MIN_WIDTH else (0, (0, 12))
+            column, padding = (1, (12, 0)) if room >= SIDE_PANEL_MIN_WIDTH else (0, 0)
             self.editor.grid(row=0, column=column, rowspan=3, sticky="nse", padx=padding, pady=(18, 20))
             self.editor.lift()
             self.editor_open = True
@@ -754,11 +798,15 @@ class CalendarPage(ctk.CTkFrame):
         self.editor.load(task_id)
 
     def close_editor(self):
+        with self.app.fade(when=self.editor_open):
+            self._close_editor()
+
+    def _close_editor(self):
         if self.editor_open:
             self.editor.grid_remove()
             self.editor_open = False
             self.editor.task_id = None
             self.editor.task = None
-            self.summary.pack(side="left", padx=(14, 0))
+            self.summary.pack(side="left", fill="x", expand=True, padx=(14, 12))
         self.board.selected_id = None
         self.board.schedule_draw()

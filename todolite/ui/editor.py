@@ -2,24 +2,29 @@
 from datetime import date, datetime, timedelta
 
 import customtkinter as ctk
+from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
 
 from ..db import task_tag_names
 from ..quickparse import parse_when
 from ..schedule import ALL_DAY_TIME, RECUR_LABELS, REMIND_CHOICES, block_window, day_label, from_text, parse_offsets, to_text, when_label
-from . import theme
-from .theme import ACCENT, BORDER, CARD_HOVER, FILL, FILL_HOVER, GREEN, Icon, MUTED, ON_FILL, RED, TEXT, TRACK
-from .widgets import Card, Chip, DatePicker, IconButton, TagPicker, field, primary_button, secondary_button, segmented, set_text
+from . import motion, theme
+from .theme import ACCENT, BORDER, CARD, CARD_HOVER, FILL, FILL_HOVER, GREEN, Icon, MUTED, ON_FILL, RED, TEXT, TRACK
+from .textfit import fit_text
+from .widgets import (Label, Card, Chip, DatePicker, IconButton, Plain, TagPicker, field, measure_text, primary_button, secondary_button, segmented, set_text,
+                      TextBox)
 
+EDITOR_WIDTH = 392
 REMIND_LABELS = {5: "5p", 15: "15p", 30: "30p", 60: "1 giờ", 1440: "1 ngày"}
 RECUR_CHOICES = {"Không": "", "Ngày": "daily", "T2–T6": "weekdays", "Tuần": "weekly", "Tháng": "monthly"}
 RECUR_BY_RULE = {rule: label for label, rule in RECUR_CHOICES.items()}
 BLOCK_PRESETS = (25, 50, 90)
 DELETE_CONFIRM_MS = 3000
+CHECKPOINT_ROOM = 276  # bề rộng dành cho chữ của một checkpoint trong panel
 
 
 class TaskEditor(Card):
     def __init__(self, master, app):
-        super().__init__(master, width=372)
+        super().__init__(master, width=EDITOR_WIDTH)
         self.app = app
         self.store = app.store
         self.task_id = None
@@ -34,18 +39,17 @@ class TaskEditor(Card):
     # ---------- Dựng giao diện ----------
 
     def _build(self):
-        top = ctk.CTkFrame(self, fg_color="transparent")
+        top = Plain(self)
         top.pack(fill="x", padx=14, pady=(12, 0))
-        self.heading = ctk.CTkLabel(top, text="Chi tiết", font=theme.semibold(13), text_color=MUTED, anchor="w")
+        self.heading = Label(top, text="Chi tiết", font=theme.semibold(13), text_color=MUTED, anchor="w")
         self.heading.pack(side="left")
         IconButton(top, Icon.CLOSE, self.app.close_editor, size=28).pack(side="right")
 
-        self.body = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=TRACK,
-                                           scrollbar_button_hover_color=MUTED)
+        self.body = motion.ScrollFrame(self, CARD)
         self.body.pack(fill="both", expand=True, padx=(8, 4), pady=(0, 6))
 
         self.title_entry = ctk.CTkEntry(self.body, height=38, border_width=0, fg_color="transparent", text_color=TEXT,
-                                        font=theme.semibold(17), placeholder_text="Tên việc")
+                                        font=theme.semibold(16), placeholder_text="Tên việc")
         self.title_entry.pack(fill="x", padx=(0, 6))
         self.title_entry.bind("<FocusOut>", self._save_title)
         self.title_entry.bind("<Return>", self._save_title)
@@ -59,15 +63,15 @@ class TaskEditor(Card):
         self._build_footer()
 
     def _section(self, title):
-        frame = ctk.CTkFrame(self.body, fg_color="transparent")
+        frame = Plain(self.body)
         frame.pack(fill="x", padx=(6, 8), pady=(10, 0))
         if title:
-            ctk.CTkLabel(frame, text=title, font=theme.text(12), text_color=MUTED, anchor="w", height=20).pack(fill="x")
+            Label(frame, text=title, font=theme.text(12), text_color=MUTED, anchor="w", height=20).pack(fill="x")
         return frame
 
     def _build_deadline(self):
         section = self._section("Hạn chót")
-        row = ctk.CTkFrame(section, fg_color="transparent")
+        row = Plain(section)
         row.pack(fill="x", pady=(2, 0))
         self.due_entry = field(row, placeholder_text="vd: mai 9h, t6 14:00, 15/11")
         self.due_entry.pack(side="left", fill="x", expand=True)
@@ -75,7 +79,7 @@ class TaskEditor(Card):
         self.due_entry.bind("<Return>", self._save_due)
         self.calendar_button = IconButton(row, Icon.CALENDAR, self._open_calendar, size=34)
         self.calendar_button.pack(side="left", padx=(4, 0))
-        chips = ctk.CTkFrame(section, fg_color="transparent")
+        chips = Plain(section)
         chips.pack(fill="x", pady=(6, 0))
         for label, days in (("Hôm nay", 0), ("Ngày mai", 1), ("Tuần sau", 7)):
             Chip(chips, label, lambda d=days: self._set_due_days(d), width=64).pack(side="left", padx=(0, 6))
@@ -83,7 +87,7 @@ class TaskEditor(Card):
 
     def _build_reminders(self):
         section = self._section("Nhắc trước hạn")
-        row = ctk.CTkFrame(section, fg_color="transparent")
+        row = Plain(section)
         row.pack(fill="x", pady=(2, 0))
         self.remind_chips = {}
         for minutes in REMIND_CHOICES:
@@ -104,10 +108,10 @@ class TaskEditor(Card):
 
     def _build_block(self):
         section = self._section("Khối thời gian (time-block)")
-        self.block_status = ctk.CTkLabel(section, text="", font=theme.text(12), text_color=ACCENT, anchor="w", height=18)
-        self.block_row = row = ctk.CTkFrame(section, fg_color="transparent")
+        self.block_status = Label(section, text="", font=theme.text(12), text_color=ACCENT, anchor="w", height=18)
+        self.block_row = row = Plain(section)
         row.pack(fill="x", pady=(2, 0))
-        self.block_start = field(row, placeholder_text="Bắt đầu: 14h, mai 9h", width=132)
+        self.block_start = field(row, placeholder_text="Bắt đầu: 14h, mai 9h", width=164)
         self.block_start.pack(side="left")
         self.block_start.bind("<FocusOut>", self._save_block_start)
         self.block_start.bind("<Return>", self._save_block_start)
@@ -116,7 +120,7 @@ class TaskEditor(Card):
             chip = Chip(row, f"{minutes}p", lambda m=minutes: self._pick_block_minutes(m), width=42)
             chip.pack(side="left", padx=(6, 0))
             self.block_chips[minutes] = chip
-        actions = ctk.CTkFrame(section, fg_color="transparent")
+        actions = Plain(section)
         actions.pack(fill="x", pady=(6, 0))
         self.start_button = primary_button(actions, "Bắt đầu ngay", self._start_block, width=118, height=30)
         self.start_button.pack(side="left")
@@ -124,29 +128,28 @@ class TaskEditor(Card):
 
     def _build_checkpoints(self):
         section = self._section("")
-        header = ctk.CTkFrame(section, fg_color="transparent")
+        header = Plain(section)
         header.pack(fill="x")
-        ctk.CTkLabel(header, text="Checkpoint", font=theme.text(12), text_color=MUTED, anchor="w", height=20).pack(side="left")
-        self.checkpoint_count = ctk.CTkLabel(header, text="", font=theme.text(12), text_color=MUTED, height=20)
+        Label(header, text="Checkpoint", font=theme.text(12), text_color=MUTED, anchor="w", height=20).pack(side="left")
+        self.checkpoint_count = Label(header, text="", font=theme.text(12), text_color=MUTED, height=20)
         self.checkpoint_count.pack(side="right")
         self.checkpoint_bar = ctk.CTkProgressBar(section, height=6, corner_radius=3, progress_color=ACCENT, fg_color=TRACK)
         self.checkpoint_bar.pack(fill="x", pady=(2, 4))
-        self.checkpoint_rows = ctk.CTkFrame(section, fg_color="transparent", height=1)
+        self.checkpoint_rows = Plain(section, height=1)
         self.new_checkpoint = field(section, placeholder_text="+ Thêm checkpoint, Enter để lưu")
         self.new_checkpoint.pack(fill="x", pady=(4, 0))
         self.new_checkpoint.bind("<Return>", self._add_checkpoint)
 
     def _build_notes(self):
         section = self._section("Ghi chú")
-        self.notes = ctk.CTkTextbox(section, height=84, corner_radius=8, border_width=1, border_color=BORDER,
-                                    fg_color=theme.FIELD, text_color=TEXT, font=theme.text(13), wrap="word",
-                                    activate_scrollbars=False)  # thanh cuộn của CTkTextbox chậm và có vòng dò nền
+        self.notes = TextBox(section, height=84, corner_radius=theme.RADIUS_CONTROL, border_width=1, border_color=BORDER,
+                             fg_color=theme.FIELD, text_color=TEXT, font=theme.text(13), wrap="word")
         self.notes.pack(fill="x", pady=(2, 0))
         self.notes.bind("<KeyRelease>", self._notes_changed)
         self.notes.bind("<FocusOut>", self._flush_notes)
 
     def _build_footer(self):
-        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer = Plain(self)
         footer.pack(fill="x", padx=14, pady=(0, 12))
         self.done_button = primary_button(footer, "Hoàn thành", self._toggle_done)
         self.done_button.pack(side="left", fill="x", expand=True)
@@ -243,9 +246,12 @@ class TaskEditor(Card):
             self.checkpoint_bar.pack_forget()
 
     def _checkpoint_row(self, row):
-        frame = ctk.CTkFrame(self.checkpoint_rows, fg_color="transparent", height=30)
+        frame = Plain(self.checkpoint_rows, height=30)
         frame.pack(fill="x")
-        box = ctk.CTkCheckBox(frame, text=row["title"], width=20, checkbox_width=18, checkbox_height=18, corner_radius=5,
+        IconButton(frame, Icon.CLOSE, lambda: self._delete_checkpoint(row["id"]), size=24).pack(side="right")  # xếp trước để chữ dài không đẩy nút ra ngoài
+        scale = ScalingTracker.get_widget_scaling(self)
+        title = fit_text(lambda piece: measure_text(theme.text(13), scale, piece), row["title"], round(CHECKPOINT_ROOM * scale))
+        box = ctk.CTkCheckBox(frame, text=title, width=20, checkbox_width=18, checkbox_height=18, corner_radius=theme.RADIUS_CHIP,
                               border_width=2, border_color=MUTED, fg_color=FILL, hover_color=FILL_HOVER, checkmark_color=ON_FILL,
                               text_color=MUTED if row["done"] else TEXT, font=theme.text(13),
                               command=lambda: self._toggle_checkpoint(row["id"], box))
@@ -253,7 +259,6 @@ class TaskEditor(Card):
             box.select()
         box.pack(side="left", fill="x", expand=True, pady=2)
         box.bind("<Double-Button-1>", lambda _event: self._rename_checkpoint(frame, row))
-        IconButton(frame, Icon.CLOSE, lambda: self._delete_checkpoint(row["id"]), size=24).pack(side="right")
 
     # ---------- Lưu thay đổi ----------
 

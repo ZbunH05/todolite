@@ -188,6 +188,11 @@ class Views(StoreCase):
     def test_done(self):
         self.assertEqual(self.ids("done"), [self.done])
 
+    def test_done_today_for_the_overview(self):
+        yesterday = self.store.add_task("Xong hôm qua", due_at="2026-10-30 09:00")
+        self.store.complete_task(yesterday, NOW - timedelta(days=1))
+        self.assertEqual(self.ids("done_today"), [self.done])
+
     def test_filters(self):
         self.assertEqual(self.ids("all", tag=self.store.find_tag("công việc")["id"]), [self.later])
         self.assertEqual(self.ids("all", search="sáng"), [self.passed])
@@ -366,6 +371,46 @@ class Migration(unittest.TestCase):
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks WHERE tag<>''").fetchone()[0], 3)
         conn.close()
+
+
+class FocusMigration(unittest.TestCase):
+    """Từ dữ liệu của bản 1.2 đến 1.5 (phiên bản 2 của schema) lên bản có lịch sử Pomodoro."""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.path = os.path.join(self.folder.name, "todo.db")
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        db._create_schema(conn)
+        db._add_tags(conn)
+        conn.execute("INSERT INTO tasks(title, due_at, created_at) VALUES('Báo cáo', '2026-10-31 09:00', '2026-10-01 08:00')")
+        conn.execute("PRAGMA user_version=2")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def test_sessions_table_is_added_and_tasks_stay(self):
+        store = Store(self.path)
+        self.assertEqual(store.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+        self.assertEqual([row["title"] for row in store.list_tasks("all", NOW)], ["Báo cáo"])
+        store.add_focus_session(1, "2026-10-31 08:00:00", 25)
+        self.assertEqual(store.focus_stats(NOW)["count"], 1)
+        store.close()
+
+    def test_backup_of_the_old_version(self):
+        Store(self.path).close()
+        conn = sqlite3.connect(os.path.join(self.folder.name, "backups", "before-schema-3.db"))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        conn.close()
+
+    def test_deleting_a_task_keeps_its_sessions(self):
+        store = Store(self.path)
+        store.add_focus_session(1, "2026-10-31 08:00:00", 25)
+        store.delete_task(1)
+        self.assertEqual([tuple(row) for row in store.conn.execute("SELECT task_id, minutes FROM focus_sessions")], [(None, 25)])
+        store.close()
 
 
 class Calendar(StoreCase):

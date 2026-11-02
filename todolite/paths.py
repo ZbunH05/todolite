@@ -13,6 +13,7 @@ VENDOR_DIR = os.path.join(ROOT, "vendor")
 ICON_PATH = os.path.join(ROOT, "assets", "app.ico")
 ICON_ALERT_PATH = os.path.join(ROOT, "assets", "app_alert.ico")
 ICON_PNG_PATH = os.path.join(ROOT, "assets", "app.png")
+FONT_PATHS = (os.path.join(ROOT, "assets", "fonts", "BeVietnamPro-Regular.ttf"), os.path.join(ROOT, "assets", "fonts", "BeVietnamPro-SemiBold.ttf"))
 
 # TODOLITE_DATA cho phép chạy thử trên dữ liệu riêng, không đụng dữ liệu thật hay đăng ký hệ thống.
 SANDBOX = bool(os.environ.get("TODOLITE_DATA"))

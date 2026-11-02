@@ -114,7 +114,7 @@ class Prompt(unittest.TestCase):
 
     def test_facts_cover_the_day(self):
         text = "\n".join(ai.day_facts(DAY))
-        for fact in ("Chủ Nhật, 01/11/2026", "23 tháng 9", "Bính Ngọ", "Kỷ Mão", "Mậu Tuất", "Câu Trần, hắc đạo", "Tý, Dần, Mão, Ngọ, Mùi, Dậu"):
+        for fact in ("Chủ Nhật, 01/11/2026", "23 tháng 9", "Bính Ngọ", "Kỷ Mão", "Mậu Tuất", "Hắc đạo Câu Trần", "trực Chấp", "Việc nên kiêng", "Tý, Dần, Mão, Ngọ, Mùi, Dậu"):
             self.assertIn(fact, text)
 
     def test_birth_year_follows_the_lunar_calendar(self):
@@ -145,8 +145,8 @@ class Offline(unittest.TestCase):
         self.assertIn(ai.GENERAL_TOPIC, ai.offline_answer("Hôm nay nên làm gì?", DAY))
 
     def test_day_quality(self):
-        self.assertIn("hắc đạo", ai.offline_answer("?", DAY))
-        self.assertIn("hoàng đạo", ai.offline_answer("?", date(2026, 11, 11)))
+        self.assertIn("Ngày xấu", ai.offline_answer("?", DAY))
+        self.assertIn("Hoàng đạo", ai.offline_answer("?", date(2026, 11, 11)))
 
     def test_says_it_is_not_ai(self):
         self.assertIn("chưa dùng AI", ai.offline_answer("?", DAY))

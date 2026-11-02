@@ -17,6 +17,10 @@ DEFAULT_EVENT_MINUTES = 30  # hạn chót có giờ hiện trên lịch tuần n
 LATE_LIMIT = timedelta(hours=12)  # nhắc trễ hơn mức này (PC tắt lâu) thì bỏ, tóm tắt sáng sẽ nêu lại
 STARTUP_LATE_LIMIT = timedelta(minutes=5)  # lúc khởi động đã có tóm tắt, không dội thêm nhắc cũ
 
+DAY_GROUP_SPAN = 14  # việc trong từng này ngày tới xếp theo từng ngày, xa hơn thì theo tháng
+SHOWS_TIME, SHOWS_DAY, SHOWS_ALL = "time", "day", "all"  # dòng việc phải tự nói tới đâu: tiêu đề nhóm đã có ngày, đã có tháng, chưa có gì
+TaskGroup = namedtuple("TaskGroup", "name tone shows tasks")  # tone: late | today | rỗng
+
 
 def to_text(moment):
     return moment.isoformat(" ", "minutes")
@@ -148,6 +152,40 @@ def collect(tasks, sent, now, late_limit=LATE_LIMIT):
     return show, skip, upcoming
 
 
+TELEGRAM_CHOICES = (15, 30, 60, 180, 360, 1440)  # nhắc trước hạn qua Telegram: 15, 30 phút, 1, 3, 6 giờ, 1 ngày
+TELEGRAM_GRACE = timedelta(minutes=10)
+
+
+def telegram_reminders(tasks, offsets, sent, now):
+    """Nhắc trước hạn qua Telegram: (cần gửi, cần bỏ qua, mốc tương lai gần nhất), mỗi mục là (task, 'tg:<phút>', hạn).
+
+    Chỉ nhắc việc có giờ. Tin đến điện thoại nên chỉ gửi khi còn đúng lúc: mốc đã qua lâu (PC tắt hay ngủ), mốc có trước
+    cả lúc tạo việc (vừa tạo việc hạn 20 phút nữa thì không nhắc "còn 30 phút"), hay hạn đã qua đều bỏ. Nhiều mốc cùng tới
+    một lúc thì chỉ gửi mốc gần hạn nhất.
+    """
+    send, skip, upcoming = [], [], None
+    for task in tasks:
+        if not task["due_at"] or task["all_day"]:
+            continue
+        due, created = from_text(task["due_at"]), from_text(task["created_at"])
+        ready = []
+        for minutes in sorted(set(offsets), reverse=True):
+            fire_at, kind = due - timedelta(minutes=minutes), f"tg:{minutes}"
+            if (task["id"], kind, task["due_at"]) in sent:
+                continue
+            if fire_at <= now:
+                ready.append((fire_at, minutes, kind))
+            elif upcoming is None or fire_at < upcoming:
+                upcoming = fire_at
+        if not ready:
+            continue
+        skip.extend((task, kind, task["due_at"]) for _, _, kind in ready[:-1])
+        fire_at, minutes, kind = ready[-1]
+        timely = now < due and fire_at >= created and now - fire_at <= max(TELEGRAM_GRACE, timedelta(minutes=minutes) / 4)
+        (send if timely else skip).append((task, kind, task["due_at"]))
+    return send, skip, upcoming
+
+
 def humanize(delta):
     """timedelta -> '1 giờ 20 phút'. Làm tròn lên để 14 phút 20 giây đọc là 15 phút."""
     minutes = max(int(delta.total_seconds() + 59) // 60, 0)
@@ -168,6 +206,12 @@ def countdown(delta):
     return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
 
 
+def countdown_up(delta):
+    """Như countdown nhưng làm tròn lên: vừa bấm 25 phút thì hiện 25:00, chỉ khi hết hẳn giờ mới hiện 00:00."""
+    seconds = delta.total_seconds()
+    return countdown(timedelta(seconds=int(seconds) + (seconds > int(seconds))))
+
+
 def day_label(day, today):
     gap = (day - today).days
     if gap == 0:
@@ -186,6 +230,74 @@ def when_label(due_at, all_day, now):
     due = from_text(due_at)
     label = day_label(due.date(), now.date())
     return label if all_day else f"{label} {due:%H:%M}"
+
+
+def day_heading(day, today):
+    """Tiêu đề nhóm một ngày: 'Ngày mai · Thứ Ba 03/11', 'Thứ Tư 04/11'."""
+    gap = (day - today).days
+    if gap == 0:
+        return "Hôm nay"
+    name = f"{WEEKDAY_LONG[day.weekday()]} {day.day:02d}/{day.month:02d}" + ("" if day.year == today.year else f"/{day.year}")
+    relative = {1: "Ngày mai", -1: "Hôm qua"}.get(gap)
+    return f"{relative} · {name}" if relative else name
+
+
+def month_heading(year, month, today):
+    return f"Tháng {month}" if year == today.year else f"Tháng {month}, {year}"
+
+
+def group_tasks(tasks, now):
+    """Chia việc theo hạn thành các nhóm có tiêu đề, đúng thứ tự trên màn hình, chỉ giữ nhóm có việc."""
+    today = now.date()
+    overdue, current, undated, days, months = [], [], [], {}, {}
+    for task in tasks:
+        if not task["due_at"]:
+            undated.append(task)
+            continue
+        due = from_text(task["due_at"])
+        gap = (due.date() - today).days
+        if due < now:
+            overdue.append(task)
+        elif gap == 0:
+            current.append(task)
+        elif gap <= DAY_GROUP_SPAN:
+            days.setdefault(due.date(), []).append(task)
+        else:
+            months.setdefault((due.year, due.month), []).append(task)
+    groups = [TaskGroup("Quá hạn", "late", SHOWS_ALL, overdue), TaskGroup("Hôm nay", "today", SHOWS_TIME, current)]
+    groups += [TaskGroup(day_heading(day, today), "", SHOWS_TIME, days[day]) for day in sorted(days)]
+    groups += [TaskGroup(month_heading(*month, today), "", SHOWS_DAY, months[month]) for month in sorted(months)]
+    groups.append(TaskGroup("Chưa có hạn", "", SHOWS_ALL, undated))
+    return [group for group in groups if group.tasks]
+
+
+def group_done(tasks, today):
+    """Việc đã xong theo ngày hoàn thành, giữ nguyên thứ tự mới nhất trước."""
+    days = {}
+    for task in tasks:
+        days.setdefault(from_text(task["done_at"]).date(), []).append(task)
+    return [TaskGroup(day_heading(day, today), "", SHOWS_ALL, items) for day, items in days.items()]
+
+
+def row_when(task, shows, now):
+    """Chữ thời hạn trên dòng việc: chỉ nói phần tiêu đề nhóm chưa nói, việc cả ngày trong nhóm theo ngày thì không còn gì để nói."""
+    due = from_text(task["due_at"])
+    moment = "" if task["all_day"] else f"{due:%H:%M}"
+    if shows == SHOWS_TIME:
+        return moment
+    if shows == SHOWS_DAY:
+        return f"{due.day:02d}/{due.month:02d} {moment}".rstrip()
+    label = when_label(task["due_at"], task["all_day"], now)
+    return "Cả ngày" if label == "Hôm nay" else label.removeprefix("Hôm nay ")
+
+
+def block_label(task, now):
+    """Khung giờ của khối thời gian. Khối nằm khác ngày với hạn thì phải ghi ngày, kẻo đọc nhầm sang ngày của nhóm."""
+    start, end = block_window(task)
+    span = f"{start:%H:%M}–{end:%H:%M}"
+    if task["due_at"] and from_text(task["due_at"]).date() == start.date():
+        return span
+    return f"{day_label(start.date(), now.date())} {span}"
 
 
 def _mid_sentence(label):

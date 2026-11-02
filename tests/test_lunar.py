@@ -192,8 +192,8 @@ class Events(unittest.TestCase):
 
     def test_saying_changes_daily(self):
         day = date(2026, 11, 1)
-        self.assertNotEqual(almanac.daily_saying(day), almanac.daily_saying(day + timedelta(days=1)))
-        self.assertEqual(almanac.daily_saying(day), almanac.daily_saying(day))
+        self.assertNotEqual(almanac.daily_sayings(day), almanac.daily_sayings(day + timedelta(days=1)))
+        self.assertEqual(almanac.daily_sayings(day), almanac.daily_sayings(day))
 
 
 class Sources(unittest.TestCase):

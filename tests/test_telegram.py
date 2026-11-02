@@ -3,11 +3,11 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 
-from todolite import telegram, vault
+from todolite import lunar, telegram, vault
 from todolite.db import Store
 from todolite.schedule import to_text
 from todolite.telegram import Bot, build_brief, send_scheduled
@@ -111,104 +111,274 @@ class Brief(ServerCase):
     def add(self, title, due, **fields):
         return self.store.add_task(title, due_at=due, remind="", **fields)
 
-    def text(self):
-        return build_brief(self.store, NOW)
+    def text(self, now=NOW):
+        return build_brief(self.store, now)
 
-    def test_opens_with_the_royal_address_and_the_lunar_date(self):
+    def section(self, title, now=NOW):
+        """Một phần của tờ tấu, tính từ tiêu đề in đậm tới dòng trống kế tiếp."""
+        return next(part for part in self.text(now).split("\n\n") if part.startswith(f"<b>{title}</b>"))
+
+
+class Structure(Brief):
+    def test_five_parts_in_the_requested_order(self):
+        self.add("Nộp đề án", "2026-11-01 14:00")
         text = self.text()
-        self.assertTrue(text.startswith("<b>Tâu hoàng thượng,</b>"))
-        self.assertIn("Chủ Nhật, 01/11/2026, nhằm ngày 23 tháng 9 năm Bính Ngọ", text)
-        self.assertIn("Ngày Kỷ Mão", text)
+        marks = ("<b>Muôn tâu Bệ hạ,</b>", "<b>Báo cáo ngày</b>", "<b>Hạn định</b>", "<b>Thuận thiên, kiêng kỵ</b>", "Thần xin cáo lui")
+        self.assertEqual([text.index(mark) for mark in marks], sorted(text.index(mark) for mark in marks))
+        self.assertTrue(text.startswith(marks[0]))
+        self.assertEqual(len(text.split("\n\n")), 5)
 
-    def test_one_deadline_reads_like_the_example(self):
+    def test_first_line_can_be_read_from_the_phone_notification(self):
+        self.add("Nộp đề án", "2026-11-01 14:00")
+        self.add("Gửi hợp đồng", "2026-10-30 07:30")
+        self.assertEqual(self.text().split("\n")[0], "<b>Muôn tâu Bệ hạ,</b> hôm nay có 1 việc đến hạn, 1 việc đã trễ.")
+
+    def test_addresses_the_emperor_only_as_be_ha(self):
+        self.add("Gửi hợp đồng", "2026-10-30 07:30")
+        self.assertNotIn("hoàng thượng", self.text().lower())
+
+    def test_day_report(self):
+        part = self.section("Báo cáo ngày")
+        self.assertIn("Chủ Nhật, 01/11/2026, tức 23 tháng 9 năm Bính Ngọ.", part)
+        self.assertIn("Ngày Kỷ Mão, tháng Mậu Tuất, tiết Sương giáng.", part)
+        self.assertIn("hôm nay là <b>ngày xấu</b>: hắc đạo Câu Trần, trực Chấp, sao Mão xấu, phạm", part)
+
+    def test_festival_is_reported(self):
+        self.assertIn("Hôm nay là Ngày Quốc khánh", self.section("Báo cáo ngày", datetime(2026, 9, 2, 7, 30)))
+
+    def test_closing_wishes_health_and_peace(self):
+        tail = self.text().split("\n\n")[-1]
+        self.assertIn("quốc thái dân an", tail)
+        self.assertTrue(tail.endswith("!"))
+        self.assertTrue(any(tail.endswith(sign) for sign in telegram.SIGN_OFFS))
+
+
+class Deadlines(Brief):
+    def test_one_deadline_today(self):
         self.add("Nộp đề án", "2026-11-01 23:59", all_day=1)
-        self.assertIn("Hôm nay hoàng thượng có deadline <b>nộp đề án</b>.", self.text())
+        self.assertIn("Hôm nay (1 việc):\n• <b>Nộp đề án</b>", self.section("Hạn định"))
 
-    def test_one_deadline_with_a_time(self):
+    def test_deadline_with_a_time(self):
         self.add("Nộp đề án", "2026-11-01 14:00")
-        self.assertIn("có deadline <b>nộp đề án</b> lúc 14:00.", self.text())
-
-    def test_several_deadlines_become_a_list(self):
-        self.add("Nộp đề án", "2026-11-01 14:00")
-        self.add("Họp nhóm", "2026-11-01 16:00")
-        text = self.text()
-        self.assertIn("Hôm nay hoàng thượng có 2 deadline:", text)
-        self.assertIn("• <b>nộp đề án</b> lúc 14:00", text)
-        self.assertIn("• <b>họp nhóm</b> lúc 16:00", text)
+        self.assertIn("• <b>Nộp đề án</b> lúc 14:00", self.section("Hạn định"))
 
     def test_empty_day(self):
-        self.assertIn("Hôm nay hoàng thượng không có deadline nào.", self.text())
+        part = self.section("Hạn định")
+        self.assertIn("Hôm nay không có việc đến hạn.", part)
+        self.assertIn("14 ngày tới chưa có hạn nào.", part)
 
-    def test_overdue_uses_the_royal_voice(self):
+    def test_overdue_comes_first(self):
         self.add("Gửi hợp đồng", "2026-10-30 07:30")
-        text = self.text()
-        self.assertIn("Thần xin nhắc, 1 việc đã quá hạn còn chờ hoàng thượng định đoạt:", text)
-        self.assertIn("gửi hợp đồng (trễ 2 ngày)", text)
+        self.add("Nộp đề án", "2026-11-01 14:00")
+        part = self.section("Hạn định")
+        self.assertIn("Đã trễ (1 việc):\n• Gửi hợp đồng (trễ 2 ngày)", part)
+        self.assertLess(part.index("Đã trễ"), part.index("Hôm nay ("))
 
-    def test_upcoming_section_lists_next_deadlines(self):
+    def test_short_delays_show_hours(self):
+        self.add("Gửi hợp đồng", "2026-11-01 05:00")
+        self.assertIn("(trễ 2 giờ 30 phút)", self.section("Hạn định"))
+
+    def test_long_delays_show_days_only(self):
+        self.add("Gửi hợp đồng", "2026-10-29 05:00")
+        self.assertIn("(trễ 3 ngày)", self.section("Hạn định"))
+
+    def test_next_fourteen_days_are_listed_with_the_time_left(self):
         self.add("Nộp đề án", "2026-11-13 23:59", all_day=1)
-        self.assertIn("• 13/11: nộp đề án (còn 12 ngày)", self.text())
+        self.assertIn("14 ngày tới (1 việc):\n• T6 13/11, còn 12 ngày: Nộp đề án", self.section("Hạn định"))
 
     def test_tomorrow_needs_no_countdown(self):
         self.add("Họp nhóm", "2026-11-02 09:00")
-        self.assertIn("• Ngày mai lúc 09:00: họp nhóm\n", self.text())
+        self.assertIn("• Ngày mai lúc 09:00: Họp nhóm", self.section("Hạn định"))
 
-    def test_upcoming_lists_the_nearest_first(self):
-        for title, due in (("Xa", "2026-12-20 09:00"), ("Rất xa", "2027-01-20 09:00"), ("Gần", "2026-11-05 09:00"), ("Sau", "2026-11-20 09:00")):
+    def test_window_ends_after_fourteen_days(self):
+        self.add("Vừa đủ", "2026-11-15 23:59", all_day=1)
+        self.add("Quá xa", "2026-11-16 00:00")
+        part = self.section("Hạn định")
+        self.assertIn("Vừa đủ", part)
+        self.assertNotIn("Quá xa", part)
+
+    def test_nearest_comes_first(self):
+        for title, due in (("Sau", "2026-11-10 09:00"), ("Gần", "2026-11-05 09:00")):
             self.add(title, due)
-        text = self.text()
-        self.assertLess(text.index("gần"), text.index("sau"))
-        self.assertLess(text.index("sau"), text.index("xa"))
-        self.assertNotIn("rất xa", text)
+        part = self.section("Hạn định")
+        self.assertLess(part.index("Gần"), part.index("Sau"))
 
     def test_time_blocks_for_today(self):
         task = self.add("Viết chương 3", None)
         self.store.update_task(task, block_start="2026-11-01 14:00", block_minutes=50)
-        self.assertIn("14:00–14:50 viết chương 3", self.text())
+        self.assertIn("Khối giờ đã định:\n• 14:00–14:50 Viết chương 3", self.section("Hạn định"))
 
-    def test_festival_is_mentioned(self):
-        text = build_brief(self.store, datetime(2026, 9, 2, 7, 30))
-        self.assertIn("Hôm nay là Ngày Quốc khánh", text)
+    def test_daily_habits_are_not_deadlines(self):
+        self.add("Uống đủ 2 lít nước", "2026-10-30 23:59", all_day=1, recur="daily")
+        self.add("Đi bộ", "2026-11-02 06:00", recur="weekdays")
+        text = self.text()
+        self.assertTrue(text.startswith("<b>Muôn tâu Bệ hạ,</b> hôm nay không có việc đến hạn."))
+        self.assertIn("Việc thường nhật: uống đủ 2 lít nước.", text)
+        self.assertNotIn("Đã trễ", text)
+        self.assertNotIn("Đi bộ", text)
+
+    def test_weekly_and_monthly_repeats_stay_deadlines(self):
+        self.add("Đóng tiền điện", "2026-11-05 23:59", all_day=1, recur="monthly")
+        self.assertIn("Đóng tiền điện", self.section("Hạn định"))
 
     def test_html_in_titles_is_escaped(self):
         self.add("Sửa <b>lỗi</b> & test", "2026-11-01 23:59", all_day=1)
-        self.assertIn("sửa &lt;b&gt;lỗi&lt;/b&gt; &amp; test", self.text())
-
-    def test_acronyms_and_names_keep_their_capitals(self):
-        self.add("API cho đề án", "2026-11-01 23:59", all_day=1)
-        self.add("Hà Nội mùa thu", "2026-11-01 23:59", all_day=1)
-        text = self.text()
-        self.assertIn("<b>API cho đề án</b>", text)
-        self.assertIn("<b>Hà Nội mùa thu</b>", text)
-
-    def test_one_letter_title(self):
-        self.add("A", "2026-11-01 23:59", all_day=1)
-        self.assertIn("<b>a</b>", self.text())
+        self.assertIn("Sửa &lt;b&gt;lỗi&lt;/b&gt; &amp; test", self.text())
 
     def test_long_lists_are_capped(self):
         for index in range(25):
             self.add(f"Việc {index}", "2026-11-01 23:59", all_day=1)
+            self.add(f"Trễ {index}", "2026-10-20 09:00")
         text = self.text()
         self.assertIn(f"• và {25 - telegram.MAX_LIST_ITEMS} việc khác", text)
+        self.assertIn(f"• và {25 - telegram.MAX_LATE_ITEMS} việc khác", text)
         self.assertLess(len(text), telegram.MESSAGE_LIMIT)
 
+
+class Context(Brief):
+    def test_quiet_day_praises_the_emperor(self):
+        tones = {telegram._pick(telegram.CALM_TONES, NOW.date() + timedelta(days=n)) for n in range(3)}
+        self.assertEqual(tones, set(telegram.CALM_TONES))
+        self.assertIn(telegram._pick(telegram.CALM_TONES, NOW.date()), self.text())
+
+    def test_overdue_turns_to_remonstrance(self):
+        self.add("Gửi hợp đồng", "2026-10-30 07:30")
+        self.assertIn(telegram._pick(telegram.LATE_TONES, NOW.date()).format(session="sớm nay"), self.text())
+
+    def test_many_overdue_risks_his_neck(self):
+        for index in range(telegram.HEAVY_LATE):
+            self.add(f"Trễ {index}", "2026-10-20 09:00")
+        self.assertIn("thà chịu búa rìu phủ việt", self.text())
+
+    def test_today_sounds_like_an_urgent_dispatch(self):
+        self.add("Nộp đề án", "2026-11-01 14:00")
+        self.assertIn(telegram._pick(telegram.URGENT_TONES, NOW.date()).format(session="sớm nay"), self.text())
+
+    def test_a_near_deadline_is_announced_ahead(self):
+        self.add("Nộp đề án", "2026-11-03 09:00")
+        self.assertIn("hạn kế tiếp chỉ còn 2 ngày", self.text())
+
+    def test_a_far_deadline_keeps_the_peace(self):
+        self.add("Nộp đề án", "2026-11-10 09:00")
+        self.assertNotIn("hạn kế tiếp", self.text())
+
+    def test_session_follows_the_real_hour(self):
+        self.add("Nộp đề án", "2026-11-01 23:00")
+        self.assertIn("tờ tấu tối nay", self.text(datetime(2026, 11, 1, 20, 15)))
+        self.assertIn("tờ tấu chiều nay", self.text(datetime(2026, 11, 1, 15, 0)))
+
+    def test_festival_opening(self):
+        self.assertIn("Nhân dịp Ngày Quốc khánh, thần cúi lạy dưới đan trì", self.text(datetime(2026, 9, 2, 7, 30)))
+
+    def test_birthday_by_the_solar_date(self):
+        self.store.set_setting("birth_date", "1999-11-01")
+        text = self.text()
+        self.assertIn("Vạn thọ thánh tiết", text)
+        self.assertIn(telegram.BIRTHDAY_WISH, text)
+
+    def test_birthday_by_the_lunar_date(self):
+        self.store.set_setting("birth_date", "1999-11-01")
+        born = lunar.solar_to_lunar(date(1999, 11, 1))
+        day = lunar.lunar_to_solar(born.day, born.month, 2027)
+        self.assertNotEqual((day.month, day.day), (11, 1))
+        self.assertIn("Vạn thọ thánh tiết", self.text(datetime(day.year, day.month, day.day, 7, 30)))
+
+    def test_no_birthday_on_other_days(self):
+        self.store.set_setting("birth_date", "1999-11-02")
+        self.assertNotIn("Vạn thọ", self.text())
+
+    def test_wording_changes_from_day_to_day(self):
+        self.assertGreater(len({self.text(NOW + timedelta(days=n)).split("\n")[-1] for n in range(6)}), 1)
+
+
+class Advice(Brief):
+    GOOD_DAY = datetime(2026, 11, 7, 7, 30)  # trực Khai
+    BAD_DAY = datetime(2026, 11, 18, 7, 30)  # phạm Thụ Tử
+
+    def test_lists_what_to_do_and_avoid(self):
+        part = self.section("Thuận thiên, kiêng kỵ", self.GOOD_DAY)
+        self.assertRegex(part, r"Việc thuận thiên: .+\.")
+        self.assertRegex(part, r"Việc kiêng kỵ: .+\.")
+        self.assertIn("Giờ hoàng đạo: Tý 23–1h, ", part)
+
+    def test_long_lists_are_shortened(self):
+        part = self.section("Thuận thiên, kiêng kỵ", datetime(2026, 11, 26, 7, 30))
+        self.assertRegex(part, r"Việc kiêng kỵ: .+ và \d+ việc khác\.")
+
+    def test_a_feared_day_advises_nothing_new(self):
+        part = self.section("Thuận thiên, kiêng kỵ", self.BAD_DAY)
+        self.assertIn("Hôm nay không có việc nên khởi sự", part)
+        self.assertIn("Việc kiêng kỵ: mọi việc lớn", part)
+
+    def test_task_on_a_forbidden_day_is_flagged_with_a_better_day(self):
+        self.add("Ký hợp đồng thuê nhà", "2026-11-18 09:00")
+        text = self.text(self.BAD_DAY)
+        self.assertIn("• <b>Ký hợp đồng thuê nhà</b> hôm nay phạm Thụ Tử, kiêng mọi việc lớn.", text)
+        self.assertRegex(text, r"Ngày gần nhất không vướng là T\d \d\d/11\.")
+        self.assertIn("định đoạt: 1 việc vướng điều kiêng có đổi ngày hay không.", text)
+
+    def test_upcoming_task_is_flagged_early(self):
+        self.add("Lễ cưới", "2026-11-02 09:00")  # ngày mai là trực Phá
+        self.assertRegex(self.text(), r"<b>Lễ cưới</b> ngày 02/11 phạm .+, kiêng cưới hỏi\.")
+
+    def test_ordinary_tasks_raise_no_flag(self):
+        self.add("Viết báo cáo", "2026-11-18 09:00")
+        self.assertNotIn("Ngu ý của thần", self.text(self.BAD_DAY))
+
+    def test_clashes_are_capped(self):
+        for index in range(telegram.MAX_CLASHES + 2):
+            self.add(f"Ký hợp đồng {index}", "2026-11-18 09:00")
+        self.assertIn("• và 2 việc khác", self.section("Thuận thiên, kiêng kỵ", self.BAD_DAY))
+
+    def test_age_note_uses_the_royal_address(self):
+        self.store.set_setting("birth_date", "1982-06-01")  # tuổi Nhâm Tuất, ngày 2/11 là ngày Canh Thìn xung Tuất
+        self.assertIn("Ngày này xung tuổi Tuất của Bệ hạ.", self.text(datetime(2026, 11, 2, 7, 30)))
+
+
+class Closing(Brief):
+    def test_asks_a_decision_on_late_work(self):
+        self.add("Gửi hợp đồng", "2026-10-30 07:30")
+        self.assertIn("Thần xin cáo lui, cúi mong Bệ hạ thánh minh định đoạt: 1 việc đã trễ nên làm ngay hay dời hạn.", self.text())
+
+    def test_two_decisions_are_listed_together(self):
+        self.add("Gửi báo cáo", "2026-10-30 07:30")
+        self.add("Ký hợp đồng", "2026-11-02 09:00")
+        self.assertIn("định đoạt: 1 việc đã trễ nên làm ngay hay dời hạn, 1 việc vướng điều kiêng có đổi ngày hay không.", self.text())
+
+    def test_asks_to_handle_today(self):
+        self.add("Nộp đề án", "2026-11-01 14:00")
+        self.assertIn("định liệu các việc đến hạn hôm nay", self.text())
+
+    def test_quiet_day_just_waits(self):
+        self.assertIn("Thần xin cáo lui, chờ thánh ý của Bệ hạ.", self.text())
+
+
+class Limits(Brief):
     def fill_every_section(self, title):
         for index in range(25):
             self.add(f"{index} {title}", "2026-11-01 23:59", all_day=1)
             self.add(f"Trễ {index} {title}", "2026-10-20 09:00")
-            self.add(f"Sau {index} {title}", "2026-11-20 09:00")
+            self.add(f"Sau {index} {title}", "2026-11-10 09:00")
             task = self.add(f"Khối {index} {title}", None)
             self.store.update_task(task, block_start=f"2026-11-01 {index % 24:02d}:00", block_minutes=30)
 
     def test_long_titles_stay_within_the_message_limit(self):
         self.fill_every_section("chữ " * 400)
-        self.assertLess(len(self.text()), telegram.MESSAGE_LIMIT)
+        text = self.text()
+        self.assertLess(len(text), telegram.MESSAGE_LIMIT)
+        self.assertIn("quốc thái dân an", text)
 
-    def test_emoji_titles_cannot_break_the_limit_or_the_markup(self):
+    def test_emoji_titles_cannot_break_the_limit_or_the_closing(self):
         self.fill_every_section("😀" * 100)
         text = self.text()
         self.assertLessEqual(len(text.encode("utf-16-le")) // 2, telegram.MESSAGE_LIMIT)
         self.assertEqual(text.count("<b>"), text.count("</b>"))
+        self.assertIn("Thần xin cáo lui", text)
+
+    def test_acronyms_and_names_keep_their_capitals_mid_sentence(self):
+        self.assertEqual(telegram._mid_sentence("API cho đề án"), "API cho đề án")
+        self.assertEqual(telegram._mid_sentence("Hà Nội mùa thu"), "Hà Nội mùa thu")
+        self.assertEqual(telegram._mid_sentence("A"), "a")
 
 
 class Calls(ServerCase):
@@ -308,10 +478,26 @@ class Scheduled(ServerCase):
         self.assertEqual(self.store.setting("telegram_last_sent"), "2026-11-01")
         self.assertIn("Đã gửi", self.store.setting("telegram_status"))
 
+    def calls(self, method):
+        return [body for path, body in FakeTelegram.received if path.endswith("/" + method)]
+
     def test_second_run_on_the_same_day_sends_nothing(self):
         self.run_it()
         self.run_it()
-        self.assertEqual(len(FakeTelegram.received), 1)
+        self.assertEqual(len(self.calls("sendMessage")), 1)
+
+    def test_menu_of_commands_is_registered_once(self):
+        self.run_it()
+        self.store.set_setting("telegram_last_sent", "")
+        self.run_it()
+        menus = self.calls("setMyCommands")
+        self.assertEqual(len(menus), 1)
+        self.assertEqual([item["command"] for item in menus[0]["commands"]], ["rp", "today", "week", "huy", "help"])
+
+    def test_a_failed_menu_does_not_spoil_the_brief(self):
+        FakeTelegram.replies = [(200, {"ok": True, "result": {"message_id": 1}}), (400, {"ok": False, "error_code": 400, "description": "x"})]
+        self.assertEqual(self.run_it(), (True, []))
+        self.assertEqual(self.store.setting("telegram_commands"), "")
 
     def test_network_hiccup_is_retried(self):
         FakeTelegram.replies = [(502, {"ok": False, "error_code": 502, "description": "Bad Gateway"})]
@@ -350,7 +536,7 @@ class Scheduled(ServerCase):
     def test_uses_the_real_tasks(self):
         self.store.add_task("Nộp đề án", due_at=to_text(NOW + timedelta(hours=3)), remind="")
         self.run_it()
-        self.assertIn("nộp đề án", FakeTelegram.received[0][1]["text"])
+        self.assertIn("Nộp đề án", FakeTelegram.received[0][1]["text"])
 
 
 if __name__ == "__main__":

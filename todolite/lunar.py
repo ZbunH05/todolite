@@ -20,7 +20,7 @@ ZODIAC = ("Chuột", "Trâu", "Hổ", "Mèo", "Rồng", "Rắn", "Ngựa", "Dê"
 SOLAR_TERMS = ("Xuân phân", "Thanh minh", "Cốc vũ", "Lập hạ", "Tiểu mãn", "Mang chủng", "Hạ chí", "Tiểu thử",
                "Đại thử", "Lập thu", "Xử thử", "Bạch lộ", "Thu phân", "Hàn lộ", "Sương giáng", "Lập đông",
                "Tiểu tuyết", "Đại tuyết", "Đông chí", "Tiểu hàn", "Đại hàn", "Lập xuân", "Vũ thủy", "Kinh trập")
-SPIRITS = ("Thanh Long", "Minh Đường", "Thiên Hình", "Chu Tước", "Kim Quỹ", "Bảo Quang",
+SPIRITS = ("Thanh Long", "Minh Đường", "Thiên Hình", "Chu Tước", "Kim Quỹ", "Kim Đường",
            "Bạch Hổ", "Ngọc Đường", "Thiên Lao", "Huyền Vũ", "Tư Mệnh", "Câu Trần")
 GOOD_SPIRITS = frozenset((0, 1, 4, 5, 7, 10))  # lục hoàng đạo, các vị trí còn lại là hắc đạo
 
@@ -180,6 +180,10 @@ def year_can_chi(year):
     return f"{CAN[(year + 6) % 10]} {CHI[(year + 8) % 12]}"
 
 
+def year_chi(year):
+    return CHI[(year + 8) % 12]
+
+
 def year_zodiac(year):
     return ZODIAC[(year + 8) % 12]
 
@@ -211,7 +215,7 @@ def good_hours(day):
             for index in range(12) if (index - start) % 12 in GOOD_SPIRITS]
 
 
-def _term_index(day):
+def term_index(day):
     """Vị trí tiết khí tại cuối ngày địa phương, nên ngày giao tiết mang tên tiết mới."""
     return int(_apparent_sun(julian_day(day) + 0.5 - TIME_ZONE / 24) // 15)
 
@@ -223,16 +227,16 @@ def _apparent_sun(moment):
 
 
 def solar_term(day):
-    return SOLAR_TERMS[_term_index(day)]
+    return SOLAR_TERMS[term_index(day)]
 
 
 def next_solar_term(day):
     """(tên tiết kế tiếp, ngày giao tiết)."""
-    current = _term_index(day)
+    current = term_index(day)
     moment = day
-    while _term_index(moment) == current:
+    while term_index(moment) == current:
         moment += timedelta(days=1)
-    return SOLAR_TERMS[_term_index(moment)], moment
+    return SOLAR_TERMS[term_index(moment)], moment
 
 
 def lunar_label(day):

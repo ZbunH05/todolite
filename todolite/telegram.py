@@ -1,193 +1,226 @@
-"""Bot Telegram: bản tin công việc mỗi ngày, lời lẽ của một vị quan tâu lên hoàng thượng.
+"""Bot Telegram: tờ tấu công việc mỗi ngày, lời lẽ của một vị quan dâng lên hoàng đế.
 
-Module này không được agent nạp: thư viện mạng tốn thêm nhiều MB RAM, trong khi bản tin chỉ
-gửi mỗi ngày một lần. Agent chạy `run.pyw --telegram` như một tiến trình riêng, sống vài giây
-rồi thoát. Nhờ vậy agent vẫn nhẹ, còn lỗi mạng không bao giờ làm nghẽn vòng lặp của nó.
+Tờ tấu có năm phần: lời mở, báo cáo ngày, hạn định, thuận thiên và kiêng kỵ, lời cáo lui. Dòng đầu
+nói ngay số việc để đọc được từ thông báo trên điện thoại. Giọng văn theo ngữ cảnh của ngày: việc
+trễ thì can gián, việc gấp thì báo khẩn, ngày rảnh thì tụng ca, ngày sinh thì chúc thọ.
+
+Module này không được agent nạp: phần lịch và dữ liệu xem ngày tốn thêm nhiều MB RAM, trong khi
+bản tin chỉ gửi mỗi ngày một lần. Agent chạy `run.pyw --telegram` như một tiến trình riêng, sống
+vài giây rồi thoát. Nhờ vậy agent vẫn nhẹ, còn lỗi mạng không bao giờ làm nghẽn vòng lặp của nó.
 """
-import html
-import json
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timedelta
+from collections import namedtuple
+from datetime import date, datetime, timedelta
 
-from . import almanac, lunar
+from . import almanac, daybook, lunar
+from .bot import Bot, ensure_commands
 from .db import Store
 from .paths import log
-from .schedule import WEEKDAY_LONG, day_label, from_text, humanize
-from .web import NETWORK_ERRORS, ApiError, check_api_url, read_json
+from .report import (MAX_LATE_ITEMS, MAX_LIST_ITEMS, MESSAGE_LIMIT, TITLE_LENGTHS, _block_line, _bullets, _is_routine, _late_line, _length,
+                     _mid_sentence, _moment, _name, _upcoming_line, _within_limit)
+from .schedule import WEEKDAY_LONG, WEEKDAY_SHORT, from_text
+from .web import ApiError
 from .win32 import acquire_mutex
 
-DEFAULT_API_URL = "https://api.telegram.org"
-REQUEST_TIMEOUT = 20
 SEND_ATTEMPTS = 4
 RETRY_DELAY = 15  # giây: lúc PC vừa bật, mạng thường chưa sẵn sàng ngay
 MAX_RETRY_DELAY = 120
-MESSAGE_LIMIT = 4096  # Telegram đếm theo đơn vị UTF-16, mỗi emoji chiếm 2
-MAX_LIST_ITEMS = 8
-MAX_TITLE_LENGTH = 80
-UPCOMING_ITEMS = 3
 SEND_MUTEX = "Local\\TodoLite.Telegram"
-CLOSINGS = ("Thần kính chúc hoàng thượng vạn sự hanh thông.", "Thần xin hầu bên cạnh, nhắc hoàng thượng từng việc.",
-            "Kính mong hoàng thượng long thể an khang.", "Thần xin kính chúc hoàng thượng một ngày thuận buồm xuôi gió.")
+
+UPCOMING_DAYS = 14
+NEAR_DAYS = 3  # hạn gần thế này thì lời mở nhắc trước dù hôm nay chưa có việc
+HEAVY_LATE = 5  # từ số việc trễ này, lời tấu chuyển sang giọng liều chết can gián
+MAX_ADVICE_ITEMS = 6
+MAX_CLASHES = 3
+
+LATE_TONES = ("Thần phận mỏng tài hèn, biết lời ngay trái tai nhưng không dám giấu, kính dâng tờ tấu {session}.",
+              "Thần trộm nghĩ, việc để lâu ắt sinh biến, nên liều dâng tờ tấu {session}.",
+              "Thần kính dâng tờ tấu {session}, cúi xin Bệ hạ thánh minh soi xét.")
+HEAVY_TONE = "Thần ngu muội, biết dâng lời này ắt phạm tội muôn chết, nhưng thà chịu búa rìu phủ việt cũng không nỡ đứng nhìn việc nước ùn ứ."
+URGENT_TONES = ("Quan trạm phi ngựa lưu tinh báo về kinh, thần không dám chậm trễ, kính dâng tờ tấu {session}.",
+                "Thần cúi rạp kính cẩn tấu trình, xin Bệ hạ xem qua tờ tấu {session}.",
+                "Thần trộm nghĩ việc hệ trọng chớ để lỡ thời, kính dâng tờ tấu {session}.")
+NEAR_TONE = "Trong ngày tạm yên, nhưng hạn kế tiếp chỉ còn {left} ngày, thần xin tấu trước để Bệ hạ liệu định."
+CALM_TONES = ("Nhờ thánh đức của Bệ hạ, thiên hạ thái bình, trong triều vô sự.",
+              "Nay mưa thuận gió hoà, bách tính an cư lạc nghiệp, thảy đều nhờ thánh đức của Bệ hạ.",
+              "Ân trạch của Bệ hạ thấm nhuần muôn nơi, trong triều hôm nay yên ổn.")
+BIRTHDAY_TONE = "Hôm nay là ngày Vạn thọ thánh tiết của Bệ hạ, thần cùng trăm quan múa lạy dưới bệ ngọc, mừng vui khôn xiết."
+FESTIVAL_TONE = "Nhân dịp {event}, thần cúi lạy dưới đan trì, kính dâng tờ tấu {session}."
+WISHES = ("Kính chúc Bệ hạ long thể an khang, quốc thái dân an.", "Nguyện Bệ hạ thánh thể vạn an, muôn dân no ấm, quốc thái dân an.",
+          "Cầu chúc Bệ hạ long thể khang kiện, vạn tuế, vạn tuế, vạn vạn tuế, quốc thái dân an.",
+          "Nguyện Bệ hạ mạnh khoẻ trường thọ, xã tắc đời đời hưng thịnh, quốc thái dân an.")
+BIRTHDAY_WISH = "Kính chúc Bệ hạ thọ sánh ngang trời đất, uy danh chấn động bốn phương, quốc thái dân an."
+SIGN_OFFS = ("Thần kính tấu!", "Thần dập đầu kính tấu!", "Thần muôn ngàn lần dập đầu, kính tấu!")
+
+Docket = namedtuple("Docket", "late today routine blocks upcoming clashes")
 
 
-def _reason(code, description):
-    """Lời giải thích dễ hiểu cho các lỗi thường gặp."""
-    text = (description or "").lower()
-    if code == 401:
-        return "Bot Token không đúng hoặc đã bị thu hồi"
-    if code == 404:
-        return "Bot Token hoặc API URL không đúng"
-    if code == 403:
-        return "Bot bị chặn hoặc không có quyền nhắn vào chat này"
-    if "chat not found" in text:
-        return "Chat ID không đúng, hoặc bạn chưa nhắn /start cho bot"
-    if code == 409:
-        return "Bot đang dùng webhook hoặc chương trình khác nên không đọc được tin nhắn. Hãy nhập Chat ID bằng tay"
-    return description or ("Máy chủ Telegram đang lỗi" if code >= 500 else "Không đọc được phản hồi của Telegram")
+def _pick(options, day):
+    """Đổi lời theo ngày để đọc mỗi sáng không thấy lặp."""
+    return options[day.toordinal() % len(options)]
 
 
-def _failure(status, body):
-    code = body.get("error_code", status)
-    retry_after = (body.get("parameters") or {}).get("retry_after", 0)
-    return ApiError(_reason(code, body.get("description")), permanent=400 <= code < 500 and code != 429, retry_after=retry_after)
+def _session(hour):
+    """Tờ tấu có thể đi lúc PC vừa bật, nên gọi tên buổi theo giờ thật."""
+    return "sớm nay" if hour < 11 else "trưa nay" if hour < 14 else "chiều nay" if hour < 18 else "tối nay"
 
 
-class Bot:
-    def __init__(self, token, api_url=DEFAULT_API_URL):
-        if not token:
-            raise ApiError("Chưa nhập Bot Token", permanent=True)
-        self.base = f"{check_api_url(api_url)}/bot{urllib.parse.quote(token, safe=':')}"
-
-    def _call(self, method, payload=None):
-        request = urllib.request.Request(f"{self.base}/{method}", data=json.dumps(payload or {}).encode("utf-8"),
-                                         headers={"Content-Type": "application/json"})
-        try:
-            try:
-                with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-                    status, raw = response.status, response.read()
-            except urllib.error.HTTPError as error:
-                with error:
-                    status, raw = error.code, error.read()
-        except NETWORK_ERRORS:
-            # Không ghi nguyên văn lỗi: URL chứa token.
-            raise ApiError("Không kết nối được tới Telegram") from None
-        body = read_json(raw)
-        if status == 200 and body.get("ok"):
-            return body.get("result")
-        raise _failure(status, body)
-
-    def me(self):
-        """Tên bot, dùng để kiểm tra token: '@ten_bot'."""
-        return "@" + self._call("getMe")["username"]
-
-    def send(self, chat_id, text):
-        return self._call("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
-
-    def latest_chat(self):
-        """(id, tên) của cuộc trò chuyện vừa nhắn cho bot, hoặc None."""
-        updates = self._call("getUpdates", {"limit": 100})
-        for update in reversed(updates):
-            message = update.get("message") or update.get("channel_post") or update.get("my_chat_member")
-            if message and "chat" in message:
-                chat = message["chat"]
-                return str(chat["id"]), chat.get("title") or chat.get("first_name") or chat.get("username") or ""
-        return None
+def _clashes(tasks):
+    """Những việc đã hẹn mà rơi đúng vào ngày kiêng loại việc đó."""
+    found = []
+    for task in tasks:
+        day = from_text(task["due_at"]).date()
+        clash = daybook.clash_of(task["title"], day)
+        if clash:
+            found.append((task, day, clash))
+    return found
 
 
-def _mid_sentence(title):
-    """Viết thường chữ đầu để đặt giữa câu, trừ từ viết tắt như 'API' và tên riêng như 'Hà Nội'."""
-    words = title.split()
-    if title[1:2].isupper() or (len(words) > 1 and words[1][0].isupper()):
-        return title
-    return title[0].lower() + title[1:]
+def _docket(store, now):
+    """Gom việc cần tấu. Việc lặp hằng ngày là nếp thường nhật, không tính là hạn để khỏi báo động giả mỗi ngày."""
+    overdue, today = store.summary_tasks(now)
+    last_day = now.date() + timedelta(days=UPCOMING_DAYS)
+    upcoming = [task for task in store.list_tasks("upcoming", now) if not _is_routine(task) and from_text(task["due_at"]).date() <= last_day]
+    due = [task for task in today if not _is_routine(task)]
+    return Docket([task for task in overdue if not _is_routine(task)], due, [task for task in overdue + today if _is_routine(task)],
+                  store.blocks_today(now), upcoming, _clashes(due + upcoming))
 
 
-def _name(task):
-    title = task["title"]
-    title = title if len(title) <= MAX_TITLE_LENGTH else title[:MAX_TITLE_LENGTH - 1].rstrip() + "…"
-    return html.escape(_mid_sentence(title), quote=False)
+def _birth(store):
+    stored = store.setting("birth_date")
+    return date.fromisoformat(stored) if stored else None
 
 
-def _moment(task):
-    return "" if task["all_day"] else f" lúc {task['due_at'][11:16]}"
+def _is_birthday(birth, day):
+    """Ngày sinh tính cả theo dương lịch lẫn âm lịch, vì nhiều nhà vẫn mừng theo ngày âm."""
+    if birth is None:
+        return False
+    born, current = lunar.solar_to_lunar(birth), lunar.solar_to_lunar(day)
+    return (birth.month, birth.day) == (day.month, day.day) or ((born.month, born.day) == (current.month, current.day) and not current.leap)
 
 
-def _bullets(lines):
-    shown = [f"• {line}" for line in lines[:MAX_LIST_ITEMS]]
-    if len(lines) > MAX_LIST_ITEMS:
-        shown.append(f"• và {len(lines) - MAX_LIST_ITEMS} việc khác")
-    return shown
+def _headline(docket):
+    late, due = len(docket.late), len(docket.today)
+    if late and due:
+        return f"hôm nay có {due} việc đến hạn, {late} việc đã trễ."
+    if late:
+        return f"đã có {late} việc trễ hạn."
+    return f"hôm nay có {due} việc đến hạn." if due else "hôm nay không có việc đến hạn."
 
 
-def _opening(now):
-    today = now.date()
-    converted = lunar.solar_to_lunar(today)
-    spirit, good = lunar.day_spirit(today)
-    lines = ["<b>Tâu hoàng thượng,</b>",
-             f"Hôm nay là {WEEKDAY_LONG[today.weekday()]}, {today:%d/%m/%Y}, nhằm ngày {lunar.lunar_text(converted)} "
-             f"năm {lunar.year_can_chi(converted.year)}.",
-             f"Ngày {lunar.day_can_chi(today)}, {spirit} {'hoàng đạo' if good else 'hắc đạo'}."]
-    events = almanac.events_on(today)
+def _tone(docket, now, birthday):
+    """Lời mở theo ngữ cảnh, việc càng cấp bách càng được ưu tiên."""
+    day, session = now.date(), _session(now.hour)
+    events = almanac.events_on(day)
+    if birthday:
+        return BIRTHDAY_TONE
+    if events:
+        return FESTIVAL_TONE.format(event=events[0], session=session)
+    if len(docket.late) >= HEAVY_LATE:
+        return HEAVY_TONE
+    if docket.late:
+        return _pick(LATE_TONES, day).format(session=session)
+    if docket.today:
+        return _pick(URGENT_TONES, day).format(session=session)
+    left = (from_text(docket.upcoming[0]["due_at"]).date() - day).days if docket.upcoming else UPCOMING_DAYS
+    return NEAR_TONE.format(left=left) if left <= NEAR_DAYS else _pick(CALM_TONES, day)
+
+
+def _opening(docket, now, birthday):
+    return [f"<b>Muôn tâu Bệ hạ,</b> {_headline(docket)}", _tone(docket, now, birthday)]
+
+
+def _day_section(now, reading):
+    day = now.date()
+    converted = lunar.solar_to_lunar(day)
+    lines = ["<b>Báo cáo ngày</b>",
+             f"{WEEKDAY_LONG[day.weekday()]}, {day:%d/%m/%Y}, tức {lunar.lunar_text(converted)} năm {lunar.year_can_chi(converted.year)}.",
+             f"Ngày {lunar.day_can_chi(day)}, tháng {lunar.month_can_chi(converted.month, converted.year)}, tiết {lunar.solar_term(day)}."]
+    events = almanac.events_on(day)
     if events:
         lines.append(f"Hôm nay là {', '.join(events)}.")
+    lines.append(f"Thần xem sách lịch, hôm nay là <b>{reading.title.lower()}</b>: {_mid_sentence(reading.reason)}.")
     return lines
 
 
-def _today_section(tasks):
-    if not tasks:
-        return ["Hôm nay hoàng thượng không có deadline nào. Thiên hạ thái bình, xin hoàng thượng an tâm."]
-    if len(tasks) == 1:
-        return [f"Hôm nay hoàng thượng có deadline <b>{_name(tasks[0])}</b>{_moment(tasks[0])}."]
-    lines = [f"Hôm nay hoàng thượng có {len(tasks)} deadline:"]
-    lines.extend(_bullets([f"<b>{_name(task)}</b>{_moment(task)}" for task in tasks]))
+def _deadline_section(docket, now, limit):
+    lines = ["<b>Hạn định</b>"]
+    if docket.late:
+        lines.append(f"Đã trễ ({len(docket.late)} việc):")
+        lines.extend(_bullets([_late_line(task, now, limit) for task in docket.late], MAX_LATE_ITEMS))
+    if docket.today:
+        lines.append(f"Hôm nay ({len(docket.today)} việc):")
+        lines.extend(_bullets([f"<b>{_name(task, limit)}</b>{_moment(task)}" for task in docket.today]))
+    else:
+        lines.append("Hôm nay không có việc đến hạn.")
+    if docket.blocks:
+        lines.append("Khối giờ đã định:")
+        lines.extend(_bullets([_block_line(row, limit) for row in docket.blocks]))
+    if docket.routine:
+        lines.append(f"Việc thường nhật: {', '.join(_mid_sentence(_name(task, limit)) for task in docket.routine[:MAX_LIST_ITEMS])}.")
+    if docket.upcoming:
+        lines.append(f"{UPCOMING_DAYS} ngày tới ({len(docket.upcoming)} việc):")
+        lines.extend(_bullets([_upcoming_line(task, now.date(), limit) for task in docket.upcoming]))
+    else:
+        lines.append(f"{UPCOMING_DAYS} ngày tới chưa có hạn nào.")
     return lines
 
 
-def _overdue_section(tasks, now):
-    if not tasks:
-        return []
-    lines = [f"Thần xin nhắc, {len(tasks)} việc đã quá hạn còn chờ hoàng thượng định đoạt:"]
-    lines.extend(_bullets([f"{_name(task)} (trễ {humanize(now - from_text(task['due_at']))})" for task in tasks]))
+def _works(items):
+    names = [_mid_sentence(item.task) for item in items[:MAX_ADVICE_ITEMS]]
+    extra = len(items) - len(names)
+    return "; ".join(names) + (f" và {extra} việc khác" if extra > 0 else "")
+
+
+def _clash_line(task, day, clash, today, limit):
+    when = "hôm nay" if day == today else f"ngày {day:%d/%m}"
+    line = f"<b>{_name(task, limit)}</b> {when} phạm {', '.join(clash.reasons[:2])}, kiêng {clash.label}."
+    other = daybook.nearest_clear_day(day, clash.work, today)
+    return f"{line} Ngày gần nhất không vướng là {WEEKDAY_SHORT[other.weekday()]} {other:%d/%m}." if other else line
+
+
+def _advice_section(docket, reading, now, birth, limit):
+    day = now.date()
+    hours = ", ".join(f"{slot.name} {slot.start}–{slot.end}h" for slot in daybook.hours_of(day) if slot.good)
+    lines = ["<b>Thuận thiên, kiêng kỵ</b>",
+             f"Việc thuận thiên: {_works(reading.do)}." if reading.do else "Hôm nay không có việc nên khởi sự, xin Bệ hạ chỉ lo việc thường nhật.",
+             f"Việc kiêng kỵ: {_works(reading.avoid)}." if reading.avoid else "Hôm nay không có việc phải kiêng.",
+             f"Giờ hoàng đạo: {hours}."]
+    note = daybook.age_note(day, birth) if birth else None
+    if note:
+        lines.append(f"{note[1].replace('của bạn', 'của Bệ hạ')}.")
+    if docket.clashes:
+        lines.append("Ngu ý của thần, các việc này nên cân nhắc:")
+        lines.extend(_bullets([_clash_line(task, when, clash, day, limit) for task, when, clash in docket.clashes], MAX_CLASHES))
     return lines
 
 
-def _blocks_section(rows):
-    if not rows:
-        return []
-    entries = []
-    for row in rows:
-        start = from_text(row["block_start"])
-        end = start + timedelta(minutes=row["block_minutes"])
-        entries.append(f"{start:%H:%M}–{end:%H:%M} {_name(row)}")
-    return ["Khối giờ đã định hôm nay:", *_bullets(entries)]
-
-
-def _upcoming_section(tasks, now):
-    lines = []
-    for task in tasks[:UPCOMING_ITEMS]:
-        day = from_text(task["due_at"]).date()
-        left = (day - now.date()).days
-        lines.append(f"• {day_label(day, now.date())}{_moment(task)}: {_name(task)}" + (f" (còn {left} ngày)" if left > 1 else ""))
-    return ["Thần cũng xin tâu các việc sắp tới:", *lines] if lines else []
-
-
-def _within_limit(text):
-    """Chốt an toàn cho độ dài: mỗi dòng là HTML trọn vẹn nên bỏ bớt dòng cuối không làm hỏng thẻ."""
-    lines = text.split("\n")
-    while len("\n".join(lines).encode("utf-16-le")) // 2 > MESSAGE_LIMIT:
-        lines.pop()
-    return "\n".join(lines)
+def _closing(docket, now, birthday):
+    asks = []
+    if docket.late:
+        asks.append(f"{len(docket.late)} việc đã trễ nên làm ngay hay dời hạn")
+    if docket.clashes:
+        asks.append(f"{len(docket.clashes)} việc vướng điều kiêng có đổi ngày hay không")
+    if asks:
+        request = f"Thần xin cáo lui, cúi mong Bệ hạ thánh minh định đoạt: {', '.join(asks)}."
+    elif docket.today:
+        request = "Thần xin cáo lui, cúi mong Bệ hạ thánh minh định liệu các việc đến hạn hôm nay."
+    else:
+        request = "Thần xin cáo lui, chờ thánh ý của Bệ hạ."
+    return [request, BIRTHDAY_WISH if birthday else _pick(WISHES, now.date()), _pick(SIGN_OFFS, now.date())]
 
 
 def build_brief(store, now):
-    """Bản tin hôm nay dạng HTML của Telegram. Tên việc đã được thoát ký tự đặc biệt."""
-    overdue, today = store.summary_tasks(now)
-    sections = (_opening(now), _today_section(today), _overdue_section(overdue, now), _blocks_section(store.blocks_today(now)),
-                _upcoming_section(store.list_tasks("upcoming", now), now), [CLOSINGS[now.date().toordinal() % len(CLOSINGS)]])
-    return _within_limit("\n\n".join("\n".join(section) for section in sections if section))
+    """Tờ tấu hôm nay dạng HTML của Telegram. Tên việc đã được thoát ký tự đặc biệt."""
+    docket, reading, birth = _docket(store, now), daybook.read_day(now.date()), _birth(store)
+    birthday = _is_birthday(birth, now.date())
+    for limit in TITLE_LENGTHS:
+        sections = (_opening(docket, now, birthday), _day_section(now, reading), _deadline_section(docket, now, limit),
+                    _advice_section(docket, reading, now, birth, limit), _closing(docket, now, birthday))
+        text = "\n\n".join("\n".join(section) for section in sections)
+        if _length(text) <= MESSAGE_LIMIT:
+            return text
+    return _within_limit(text)
 
 
 def send_brief(store, now):
@@ -220,6 +253,7 @@ def send_scheduled(store=None, now=None, wait=time.sleep):
         else:
             store.set_setting("telegram_last_sent", today)
             store.set_setting("telegram_status", f"{now:%H:%M %d/%m}: Đã gửi bản tin")
+            ensure_commands(store, Bot(store.secret("telegram_token"), store.setting("telegram_api_url")))
             return True
 
 

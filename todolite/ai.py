@@ -1,10 +1,10 @@
 """Thầy tử vi: luận giải qua API kiểu OpenAI (mặc định DeepSeek), chưa có key thì luận mẫu ngay tại máy.
 
-Thư viện mạng chỉ được nạp trong stream_answer, nên mở trang Tử vi không làm nặng giao diện.
+Phần mạng chỉ được nạp trong stream_answer, nên mở trang Tử vi không làm nặng giao diện.
 """
 import json
 
-from . import lunar
+from . import daybook, lunar
 from .schedule import WEEKDAY_LONG
 
 TIMEOUT = 40
@@ -24,8 +24,8 @@ TOPICS = ((("tình", "yêu", "duyên", "hôn nhân", "vợ", "chồng"),
           (("tài chính", "tiền", "thu nhập", "lương", "đầu tư"),
            "Về tiền bạc, hãy giữ kỷ luật chi tiêu và cân nhắc kỹ các khoản lớn, đừng quyết định theo cảm xúc."))
 GENERAL_TOPIC = "Hôm nay hợp với việc sắp xếp lại ưu tiên và làm trọn từng việc nhỏ, đừng ôm đồm cùng lúc."
-GOOD_DAY = "Ngày {spirit} là ngày hoàng đạo, thuận cho việc khởi đầu và gặp gỡ."
-BAD_DAY = "Ngày {spirit} là ngày hắc đạo, nên ưu tiên việc quen tay và chuẩn bị kỹ, để dành chuyện lớn cho ngày khác."
+DAY_REMINDERS = {daybook.GOOD: "thuận cho việc khởi đầu và gặp gỡ.", daybook.AVERAGE: "làm việc thường ngày thì ổn, việc lớn nên xem kỹ phần nên và kiêng.",
+                 daybook.BAD: "nên ưu tiên việc quen tay và chuẩn bị kỹ, để dành chuyện lớn cho ngày khác."}
 OFFLINE_NOTE = "Đây là bản luận mẫu tạo ngay trên máy từ dữ kiện lịch, chưa dùng AI. Thêm API key trong Cài đặt để hỏi chi tiết hơn."
 
 
@@ -33,14 +33,19 @@ def _hours(day):
     return ", ".join(hour.name for hour in lunar.good_hours(day))
 
 
+def _tasks(items):
+    return ", ".join(item.task for item in items) or "không có"
+
+
 def day_facts(day):
-    """Dữ kiện lịch của ngày xem, mỗi dòng một nhãn."""
+    """Dữ kiện lịch của ngày xem, mỗi dòng một nhãn. Cùng dữ kiện với tờ lịch để AI không nói khác trang Vạn niên."""
     converted = lunar.solar_to_lunar(day)
-    spirit, good = lunar.day_spirit(day)
+    reading = daybook.read_day(day)
     return [f"Dương lịch: {WEEKDAY_LONG[day.weekday()]}, {day:%d/%m/%Y}", f"Âm lịch: {lunar.lunar_text(converted)}",
             f"Năm âm lịch: {lunar.year_can_chi(converted.year)}", f"Can chi ngày: {lunar.day_can_chi(day)}",
             f"Can chi tháng: {lunar.month_can_chi(converted.month, converted.year)}", f"Giờ mở đầu: {lunar.first_hour_can_chi(day)}",
-            f"Trực ngày: {spirit}, {'hoàng đạo' if good else 'hắc đạo'}", f"Giờ hoàng đạo: {_hours(day)}"]
+            f"Đánh giá: {reading.title}, {reading.reason}", f"Việc nên làm: {_tasks(reading.do)}", f"Việc nên kiêng: {_tasks(reading.avoid)}",
+            f"Giờ hoàng đạo: {_hours(day)}"]
 
 
 def birth_lunar(birth):
@@ -66,12 +71,12 @@ def offline_answer(question, day, birth=None):
     text = question.lower()
     topic = next((sentence for words, sentence in TOPICS if any(word in text for word in words)), GENERAL_TOPIC)
     converted = lunar.solar_to_lunar(day)
-    spirit, good = lunar.day_spirit(day)
+    reading = daybook.read_day(day)
     context = [f"{day:%d/%m/%Y}, tức {lunar.lunar_text(converted)} năm {lunar.year_can_chi(converted.year)}.",
                f"Ngày {lunar.day_can_chi(day)}, tháng {lunar.month_can_chi(converted.month, converted.year)}, giờ tốt: {_hours(day)}."]
     if birth:
         context.append(f"Người sinh ngày {birth_text(birth)}.")
-    reminder = (GOOD_DAY if good else BAD_DAY).format(spirit=spirit)
+    reminder = f"{reading.title} ({reading.reason}): {DAY_REMINDERS[reading.quality]}"
     return f"## Tổng quan\n{topic}\n\n## Bối cảnh ngày xem\n{' '.join(context)}\n\n## Lời nhắc\n{reminder}\n\n{OFFLINE_NOTE}"
 
 
@@ -103,11 +108,9 @@ def _piece(line):
     return (choices[0].get("delta") or {}).get("content")
 
 
-def _problem(error, read_json):
+def _problem(code, body):
     """Lời giải thích dễ hiểu cho một phản hồi lỗi."""
-    code = error.code
-    with error:
-        detail = read_json(error.read()).get("error")
+    detail = body.get("error")
     if code in (401, 403):
         return "API key không đúng hoặc đã hết hạn"
     if code == 402:
@@ -130,16 +133,16 @@ def request_body(url, model, messages):
 
 def stream_answer(url, key, model, messages):
     """Sinh từng mảnh chữ của câu trả lời. Mọi lỗi được báo bằng ApiError với lời giải thích dễ hiểu."""
-    import urllib.error
-    import urllib.request
+    from .web import NETWORK_ERRORS, ApiError, check_api_url, post, read_json
 
-    from .web import NETWORK_ERRORS, ApiError, check_api_url, read_json
-
-    request = urllib.request.Request(check_api_url(url), data=json.dumps(request_body(url, model, messages)).encode("utf-8"),
-                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    address = check_api_url(url)
+    data = json.dumps(request_body(url, model, messages)).encode("utf-8")
+    headers = f"Content-Type: application/json\r\nAuthorization: Bearer {key}"
     received = False
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with post(address, data, headers, TIMEOUT) as response:
+            if response.status != 200:
+                raise ApiError(_problem(response.status, read_json(response.read())), permanent=True)
             for raw in response:
                 line = raw.strip()
                 if line == b"data: [DONE]":
@@ -148,11 +151,8 @@ def stream_answer(url, key, model, messages):
                 if piece:
                     received = True
                     yield piece
-    except urllib.error.HTTPError as error:
-        raise ApiError(_problem(error, read_json), permanent=True) from None
     except NETWORK_ERRORS as error:
-        slow = isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
-        raise ApiError("Máy chủ AI phản hồi quá chậm. Vui lòng thử lại." if slow
+        raise ApiError("Máy chủ AI phản hồi quá chậm. Vui lòng thử lại." if isinstance(error, TimeoutError)
                        else "Không kết nối được tới máy chủ AI lúc này.") from None
     if not received:
         raise ApiError("Máy chủ AI chưa trả về nội dung hợp lệ.")

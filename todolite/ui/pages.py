@@ -1,31 +1,42 @@
 """Ba trang của ứng dụng: Tổng quan, danh sách task, cài đặt."""
 import os
 import threading
+import time
 from datetime import datetime, timedelta
 from queue import SimpleQueue
 
+import tkinter as tk
+
 import customtkinter as ctk
+from customtkinter.windows.widgets.appearance_mode.appearance_mode_tracker import AppearanceModeTracker
 from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
 
-from .. import APP_NAME, __version__, integration
+from .. import APP_NAME, __version__, daybook, integration, quotes
 from ..db import DEFAULT_SETTINGS, TAG_COLORS
 from ..lunar import lunar_text, solar_to_lunar
 from ..paths import DATA_DIR
-from ..schedule import REMIND_CHOICES, WEEKDAY_LONG, active_block, block_window, countdown, from_text, humanize, next_block, parse_offsets
+from ..schedule import REMIND_CHOICES, TELEGRAM_CHOICES, WEEKDAY_LONG, active_block, countdown, from_text, humanize, next_block, parse_offsets
 from ..win32 import WM_APP_SUMMARY, post_agent
-from . import theme
+from . import motion, theme
 from .editor import BLOCK_PRESETS, REMIND_LABELS, TaskEditor
-from .theme import (ACCENT, ACCENT_SOFT, AMBER, BG, BORDER, CARD_HOVER, FILL, GREEN, GREEN_SOFT, Icon, MUTED, RED, RED_SOFT, TEXT, TRACK)
-from .widgets import Card, Chip, IconButton, QuickEntry, TaskList, WeekChart, field, group_entries, primary_button, secondary_button, segmented, set_text
+from .theme import ACCENT, AMBER, BG, BORDER, CARD, CARD_HOVER, FILL, GREEN, Icon, MUTED, RED, TEXT, TRACK, resolve
+from .shapes import rounded
+from .textfit import fit_text, side_by_side, uniform_columns
+from .widgets import (Card, Chip, DayBand, FitLabel, FontCache, IconButton, Label, Plain, QuickEntry, Scaled, TaskList, scaled, draw_week, field,
+                      group_entries, measure_text, primary_button, secondary_button, segmented, set_label, set_text)
 
+SETTING_TABS = ("Chung", "Thông báo", "Telegram", "Tử vi AI")
 VIEW_TITLES = {"today": "Hôm nay", "upcoming": "Sắp tới", "all": "Tất cả việc", "done": "Đã xong"}
 EMPTY_TEXTS = {"today": "Hôm nay chưa có việc nào.\nGõ vào ô phía trên để thêm việc đầu tiên.",
                "upcoming": "Chưa có việc nào sắp tới.", "all": "Danh sách trống. Thêm việc đầu tiên nhé!",
                "done": "Chưa hoàn thành việc nào."}
 GREETING_HOURS = ((5, "Khuya rồi"), (11, "Chào buổi sáng"), (13, "Chào buổi trưa"), (18, "Chào buổi chiều"), (22, "Chào buổi tối"))
-MAX_BLOCK_LINES = 5
-LONG_FIELD_WIDTH = 300
+LONG_FIELD_WIDTH = 324
+CHART_MIN_WIDTH, COMPACT_HEIGHT = 860, 700
+SEARCH_WIDTH, SEARCH_WIDTH_NARROW, SEARCH_NARROW_BELOW = 170, 116, 450
+SEARCH_HINT, SEARCH_HINT_NARROW = "Tìm kiếm…   (Ctrl+F)", "Tìm kiếm…"
 SAVED_HINT = "Đã lưu, nhập để thay"
+TELEGRAM_LABELS = {15: "15p", 30: "30p", 60: "1 giờ", 180: "3 giờ", 360: "6 giờ", 1440: "1 ngày"}
 
 
 def greeting(hour):
@@ -35,67 +46,165 @@ def greeting(hour):
     return "Khuya rồi"
 
 
-def bind_click(root, command):
-    """Cả thẻ bấm được: gắn sự kiện cho thẻ và mọi widget bên trong."""
-    root.bind("<Button-1>", lambda _: command())
-    for child in root.winfo_children():
-        bind_click(child, command)
+class StatStrip(Scaled, tk.Canvas):
+    """Bốn con số của hôm nay trên cùng một dải, để phần việc cần làm còn nhiều chỗ. Cả thẻ vẽ trên một Canvas: dựng bằng thẻ,
+    ô, nhãn và biểu đồ CustomTkinter là gần 50 cửa sổ Tk. Mỗi ô bấm được để tới danh sách tương ứng, rê chuột thì ô sáng lên."""
+    STATS = (("today", "Còn lại hôm nay", "Còn lại", "today"), ("overdue", "Quá hạn", "Quá hạn", "today"),
+             ("rate", "Hoàn thành", "Đã xong", "done"), ("week", "7 ngày qua", "7 ngày", "calendar"))
+    FONTS = {"number": ("FONT_DISPLAY", 32, 0), "title": ("FONT_SEMIBOLD", 13, 0), "note": ("FONT_TEXT", 12, 0)}
+    PAD, NUMBER_LEFT, NUMBER_GAP, NUMBER_HEIGHT, NUMBER_PAD = 4, 10, 8, 48, 4
+    TITLE_HEIGHT, NOTE_HEIGHT = 20, 18
+    CHART_WIDTH, CHART_HEIGHT, CHART_PAD, CHART_RIGHT = 84, 36, 6, 10
 
+    def __init__(self, master, app):
+        super().__init__(master, highlightthickness=0, bd=0)
+        self.app = app
+        self.fonts = FontCache(self.FONTS)
+        self.values = {key: ("0", "", TEXT) for key, *_ in self.STATS}
+        self.week = []
+        self.hover = None
+        self.cells = []  # khung từng ô ở lần vẽ cuối, để biết chuột đang ở ô nào
+        self.chart_shown = True
+        self.height = 0
+        self.bind("<Configure>", lambda _: self._paint())
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", lambda _: self._set_hover(None))
+        self.bind("<Button-1>", self._on_click)
+        AppearanceModeTracker.add(lambda _mode: self._paint(), self)
+        ScalingTracker.add_widget(self._on_scaling, self)
+        self._on_scaling(ScalingTracker.get_widget_scaling(self))
 
-class KpiCard(Card):
-    def __init__(self, master, title, glyph, color, tint):
-        super().__init__(master, height=124)
-        self.pack_propagate(False)
-        self.header = ctk.CTkFrame(self, fg_color="transparent")
-        self.header.pack(fill="x", padx=16, pady=(12, 0))
-        ctk.CTkLabel(self.header, text=title, font=theme.text(13), text_color=MUTED, height=30).pack(side="left")
-        ctk.CTkLabel(self.header, text=glyph, width=30, height=30, corner_radius=8, fg_color=tint, text_color=color,
-                     font=theme.icon(15)).pack(side="right")
-        self.body = ctk.CTkFrame(self, fg_color="transparent")
-        self.body.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+    def _px(self, value):
+        return scaled(value, self._scale)
 
+    def _on_scaling(self, scale, _window=None):
+        self._scale = scale
+        self.fonts.rescale(scale)
+        line = lambda name: self.fonts.get(name).metrics("linespace")  # noqa: E731
+        self.number_height = max(self._px(self.NUMBER_HEIGHT), line("number"))
+        self.title_height = max(self._px(self.TITLE_HEIGHT), line("title"))
+        self.note_height = max(self._px(self.NOTE_HEIGHT), line("note"))
+        self.cell_height = max(self.number_height + 2 * self._px(self.NUMBER_PAD), self.title_height + self.note_height)
+        self.height = self.cell_height + 2 * self._px(self.PAD)
+        self.configure(height=self.height)
+        self._relayout()
+        self._paint()
 
-class NumberCard(KpiCard):
-    def __init__(self, master, title, glyph, color, tint):
-        super().__init__(master, title, glyph, color, tint)
-        self.number = ctk.CTkLabel(self.body, text="0", font=theme.display(36), text_color=TEXT, anchor="w", height=42)
-        self.number.pack(fill="x")
-        self.note = ctk.CTkLabel(self.body, text="", font=theme.text(12), text_color=MUTED, anchor="w", height=18)
-        self.note.pack(fill="x")
-
-    def show(self, number, note, color=TEXT):
-        self.number.configure(text=str(number), text_color=color)
-        self.note.configure(text=note)
-
-
-class RateCard(KpiCard):
-    def __init__(self, master):
-        super().__init__(master, "Tỷ lệ hoàn thành", Icon.DONE, GREEN, GREEN_SOFT)
-        self.number = ctk.CTkLabel(self.body, text="—", font=theme.display(36), text_color=TEXT, anchor="w", height=36)
-        self.number.pack(fill="x")
-        self.bar = ctk.CTkProgressBar(self.body, height=6, corner_radius=3, fg_color=TRACK, progress_color=GREEN)
-        self.bar.pack(fill="x", pady=(0, 2))
-        self.note = ctk.CTkLabel(self.body, text="", font=theme.text(12), text_color=MUTED, anchor="w", height=18)
-        self.note.pack(fill="x")
+    def fit(self, width):
+        """Cửa sổ hẹp thì bỏ biểu đồ và dùng nhãn ngắn, con số vẫn đủ ý."""
+        shown = width >= CHART_MIN_WIDTH
+        if shown != self.chart_shown:
+            self.chart_shown = shown
+            self._paint()
 
     def show(self, stats):
-        rate = stats["rate"]
-        self.number.configure(text="—" if rate is None else f"{round(rate * 100)}%")
-        self.bar.set(rate or 0)
-        self.note.configure(text=f"{stats['done_today']}/{stats['planned']} việc hôm nay")
+        overdue, rate = stats["overdue"], stats["rate"]
+        values = {"today": (str(stats["today_open"]), f"{stats['done_today']} việc đã xong", TEXT),
+                  "overdue": (str(overdue), "Cần xử lý ngay" if overdue else "Không có việc trễ", RED if overdue else GREEN),
+                  "rate": ("—" if rate is None else f"{round(rate * 100)}%", f"{stats['done_today']}/{stats['planned']} việc",
+                           GREEN if stats["done_today"] else TEXT),
+                  "week": (str(sum(count for _, count in stats["week"])), "việc đã xong", TEXT)}
+        if values != self.values or stats["week"] != self.week:
+            self.values, self.week = values, stats["week"]
+            self._paint()
+
+    def _paint(self):
+        self.delete("all")
+        width, height = self.winfo_width(), self.height
+        self.configure(bg=resolve(BG))
+        self.cells = []
+        if width < 40:
+            return
+        px = self._px
+        rounded(self, 0, 0, width, height, self._px(theme.RADIUS_CARD), resolve(CARD), resolve(BG), outline=resolve(BORDER))
+        pad, rule = px(self.PAD), px(1)  # khe 1 điểm ảnh giữa các ô, chỗ của vạch ngăn mà bản CustomTkinter chưa bao giờ vẽ ra
+        titles = [title if self.chart_shown else short for _key, title, short, _target in self.STATS]
+        want = max(self._wanted(key, title) for (key, *_), title in zip(self.STATS, titles)) + 2 * pad
+        left = 0
+        for index, (column, (key, *_), title) in enumerate(zip(uniform_columns(width, want, 4, rule), self.STATS, titles)):
+            box = (left + pad, pad, left + column - pad, pad + self.cell_height)
+            self.cells.append(box)
+            self._paint_cell(index, key, title, box)
+            left += column + rule
+
+    def _wanted(self, key, title):
+        """Bề rộng ô cần để đủ chữ, như ô dựng bằng widget báo cho grid: chia cột theo đó mới khớp từng điểm ảnh."""
+        number, note, _color = self.values[key]
+        chart = round(self.CHART_WIDTH * self._scale) + self._px(self.CHART_RIGHT) if key == "week" and self.chart_shown else 0
+        return (self._px(self.NUMBER_LEFT) + self.fonts.measure("number", number) + self._px(self.NUMBER_GAP)
+                + max(self.fonts.measure("title", title), self.fonts.measure("note", note)) + chart)
+
+    def _paint_cell(self, index, key, title, box):
+        """Bố cục giống bản dựng bằng widget: số bên trái, nhãn và ghi chú giãn theo chỗ, biểu đồ bên phải ô cuối."""
+        px, (x0, y0, x1, _y1) = self._px, box
+        back = CARD_HOVER if index == self.hover else CARD
+        if index == self.hover:
+            rounded(self, *box, self._px(theme.RADIUS_CONTROL), resolve(CARD_HOVER), resolve(CARD))
+        number, note, color = self.values[key]
+        font = self.fonts.get("number")
+        left, pad = x0 + px(self.NUMBER_LEFT), px(self.NUMBER_PAD)
+        top = y0 + pad + (self.cell_height - 2 * pad - self.number_height) // 2
+        self.create_text(left, top + (self.number_height - font.metrics("linespace")) // 2, text=number, font=font, fill=resolve(color),
+                         anchor="nw")
+        left += self.fonts.measure("number", number) + px(self.NUMBER_GAP)
+        chart = key == "week" and self.chart_shown
+        wanted = max(self.fonts.measure("title", title), self.fonts.measure("note", note))
+        room, after = side_by_side(x1 - left, wanted, round(self.CHART_WIDTH * self._scale) + px(self.CHART_RIGHT) if chart else 0)
+        top = y0 + (self.cell_height - self.title_height - self.note_height) // 2
+        for name, content, height, fill in (("title", title, self.title_height, TEXT), ("note", note, self.note_height, MUTED)):
+            font = self.fonts.get(name)
+            self.create_text(left, top + (height - font.metrics("linespace")) // 2, text=self.fonts.fit(name, content, room), font=font,
+                             fill=resolve(fill), anchor="nw")
+            top += height
+        if chart:
+            size, chart_pad, width = round(self.CHART_HEIGHT * self._scale), px(self.CHART_PAD), max(after - px(self.CHART_RIGHT), 0)
+            top = y0 + chart_pad + (self.cell_height - 2 * chart_pad - size) // 2
+            draw_week(self, x1 - px(self.CHART_RIGHT) - width, top, width, size, self.week, back, self._scale, ("bar",))
+
+    def _cell_at(self, x, y):
+        return next((index for index, (x0, y0, x1, y1) in enumerate(self.cells) if x0 <= x < x1 and y0 <= y < y1), None)
+
+    def _on_motion(self, event):
+        self._set_hover(self._cell_at(event.x, event.y))
+
+    def _set_hover(self, index):
+        if index != self.hover:
+            self.hover = index
+            self.configure(cursor="hand2" if index is not None else "")
+            self._paint()
+
+    def _on_click(self, event):
+        index = self._cell_at(event.x, event.y)
+        if index is not None:
+            self.app.navigate(self.STATS[index][3])
 
 
-class WeekCard(KpiCard):
+class QuoteCard(Card):
+    """Câu nói hôm nay trên Tổng quan: mỗi ngày một câu của kho quotes.py, trong các chủ đề chọn ở Cài đặt, ghi rõ tác giả."""
+
     def __init__(self, master):
-        super().__init__(master, "7 ngày qua", Icon.CHART, ACCENT, ACCENT_SOFT)
-        self.total = ctk.CTkLabel(self.header, text="", font=theme.semibold(13), text_color=TEXT, height=30)
-        self.total.pack(side="right", padx=(0, 8))
-        self.chart = WeekChart(self.body)
-        self.chart.pack(fill="both", expand=True, pady=(4, 0))
+        super().__init__(master)
+        self.shown = None
+        self.kind = Label(self, text="", font=theme.semibold(13), text_color=ACCENT, anchor="w", height=20)
+        self.kind.pack(fill="x", padx=16, pady=(12, 0))
+        self.body = Label(self, text="", font=theme.semibold(14), text_color=TEXT, anchor="w", justify="left", height=22, elastic=True)
+        self.body.pack(fill="x", padx=16, pady=(2, 0))
+        self.author = Label(self, text="", font=theme.text(13), text_color=MUTED, anchor="w", justify="left", height=20, elastic=True)
+        self.author.pack(fill="x", padx=16, pady=(4, 12))
+        self.bind("<Configure>", self._wrap)
 
-    def show(self, week):
-        self.total.configure(text=f"{sum(count for _, count in week)} việc")
-        self.chart.set_week(week)
+    def _wrap(self, event):
+        width = event.width / ScalingTracker.get_widget_scaling(self) - 34
+        self.body.configure(wraplength=width)
+        self.author.configure(wraplength=width)
+
+    def show(self, day, topics):
+        if (day, topics) != self.shown:
+            self.shown = (day, topics)
+            quote = quotes.for_day(day, topics)
+            self.kind.configure(text=f"Câu nói hôm nay · {quote.label}")
+            self.body.configure(text=f"“{quote.text}”")
+            self.author.configure(text=f"— {quote.author}")
 
 
 class FocusCard(Card):
@@ -107,34 +216,52 @@ class FocusCard(Card):
         self.dashboard = dashboard
         self.current_id = None
         self.block = None
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=16, pady=(12, 0))
-        ctk.CTkLabel(header, text="Tập trung", font=theme.semibold(15), text_color=TEXT, height=24).pack(side="left")
-        ctk.CTkLabel(header, text=Icon.TIMER, font=theme.icon(15), text_color=ACCENT, height=24).pack(side="right")
+        self.heading = Label(self, text="Tập trung", font=theme.semibold(16), text_color=TEXT, anchor="w", height=26)
+        self.heading.pack(fill="x", padx=16, pady=(12, 0))
+        self.parts = Plain(self)  # CTk gọi lại lệnh pack mỗi khi đổi cỡ chữ, nên "before" phải trỏ tới khung luôn còn đó
+        self.parts.pack(fill="x", padx=16, pady=(4, 14))
         self._build_active()
         self._build_idle()
-        self.active.pack(fill="x", padx=16, pady=(4, 14))
+        self.shown = self.idle
+        self._show(self.active)
+
+    def _show(self, part):
+        if part is not self.shown:
+            self.shown.pack_forget()
+            part.pack(fill="x")
+            self.shown = part
+
+    def set_compact(self, compact):
+        """Cửa sổ thấp thì bỏ tiêu đề: đồng hồ đã tự nói thẻ này để làm gì."""
+        if compact:
+            self.heading.pack_forget()
+            self.parts.pack(fill="x", padx=16, pady=(12, 14))
+        else:
+            self.heading.pack(fill="x", padx=16, pady=(12, 0), before=self.parts)
+            self.parts.pack(fill="x", padx=16, pady=(4, 14))
 
     def _build_active(self):
-        self.active = ctk.CTkFrame(self, fg_color="transparent")
-        self.active_title = ctk.CTkLabel(self.active, text="", font=theme.text(13), text_color=MUTED, anchor="w", height=20)
+        self.active = Plain(self.parts)
+        self.active_title = FitLabel(self.active, font=theme.text(13), text_color=MUTED, anchor="w", height=20)
         self.active_title.pack(fill="x")
-        self.clock = ctk.CTkLabel(self.active, text="00:00", font=theme.display(50), text_color=ACCENT, anchor="w", height=64)
+        self.clock = Label(self.active, text="00:00", font=theme.display(48), text_color=ACCENT, anchor="w", height=64)
         self.clock.pack(fill="x")
         self.progress = ctk.CTkProgressBar(self.active, height=6, corner_radius=3, fg_color=TRACK, progress_color=ACCENT)
         self.progress.pack(fill="x", pady=(2, 10))
-        buttons = ctk.CTkFrame(self.active, fg_color="transparent")
+        self.progress.bind("<Configure>", lambda _: setattr(self, "progress_step", None), add="+")
+        self.progress_step = None
+        buttons = Plain(self.active)
         buttons.pack(fill="x")
-        secondary_button(buttons, "+5 phút", self._extend, width=78).pack(side="left")
-        secondary_button(buttons, "Kết thúc", self._finish, width=78).pack(side="left", padx=(6, 0))
+        secondary_button(buttons, "+5p", self._extend, width=44).pack(side="left")
+        secondary_button(buttons, "Kết thúc", self._finish, width=64).pack(side="left", padx=(6, 0))
         primary_button(buttons, "Hoàn thành", self._complete).pack(side="left", fill="x", expand=True, padx=(6, 0))
 
     def _build_idle(self):
-        self.idle = ctk.CTkFrame(self, fg_color="transparent")
-        self.idle_text = ctk.CTkLabel(self.idle, text="", font=theme.text(13), text_color=MUTED, anchor="w", justify="left")
+        self.idle = Plain(self.parts)
+        self.idle_text = Label(self.idle, text="", font=theme.text(13), text_color=MUTED, anchor="w", justify="left", elastic=True)
         self.idle_text.pack(fill="x")
         self.idle.bind("<Configure>", self._wrap_idle_text)
-        self.presets = ctk.CTkFrame(self.idle, fg_color="transparent")
+        self.presets = Plain(self.idle)
         self.presets.pack(fill="x", pady=(8, 0))
         for minutes in BLOCK_PRESETS:
             secondary_button(self.presets, f"{minutes} phút", lambda m=minutes: self._start(m), width=60).pack(
@@ -166,16 +293,13 @@ class FocusCard(Card):
         block = active_block(tasks, now)
         self.current_id = block[0]["id"] if block else None
         if block:
-            self.idle.pack_forget()
-            self.active.pack(fill="x", padx=16, pady=(4, 14))
-            title = block[0]["title"]
-            self.active_title.configure(text=title if len(title) <= 42 else title[:41] + "…")
+            self._show(self.active)
+            self.active_title.set_text(block[0]["title"])
             self.block = block
             self.tick(now)
             return
         self.block = None
-        self.active.pack_forget()
-        self.idle.pack(fill="x", padx=16, pady=(4, 14))
+        self._show(self.idle)
         selected = self.app.store.get_task(self.dashboard.selected_id) if self.dashboard.selected_id else None
         coming = next_block(tasks, now)
         lines = []
@@ -185,7 +309,7 @@ class FocusCard(Card):
             lines.append("Chọn một việc trong danh sách, rồi chọn thời lượng để bắt đầu đếm ngược.")
         if coming:
             lines.append(f"Khối tiếp theo {coming[1]:%H:%M}: {coming[0]['title']} (sau {humanize(coming[1] - now)})")
-        self.idle_text.configure(text="\n".join(lines))
+        set_label(self.idle_text, text="\n".join(lines))
 
     def tick(self, now):
         if not self.block:
@@ -194,8 +318,12 @@ class FocusCard(Card):
         if now >= end:
             self.dashboard.app.refresh()
             return
-        self.clock.configure(text=countdown(end - now))
-        self.progress.set(min(max((end - now) / (end - start), 0), 1))
+        set_label(self.clock, text=countdown(end - now))
+        value = min(max((end - now) / (end - start), 0), 1)
+        step = round(value * self.progress.winfo_width())
+        if step != self.progress_step:  # khối 50 phút chỉ dịch 1 điểm ảnh mỗi chục giây, không vẽ lại thanh mỗi giây
+            self.progress_step = step
+            self.progress.set(value)
 
 
 class Dashboard(ctk.CTkFrame):
@@ -206,102 +334,110 @@ class Dashboard(ctk.CTkFrame):
         self.selected_id = None
         self.deadline = None
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
+        self.compact = False
+        self.bind("<Configure>", self._fit)
 
-        header = ctk.CTkFrame(self, fg_color="transparent")
+        header = Plain(self)
         header.grid(row=0, column=0, sticky="ew", padx=24, pady=(18, 10))
-        self.hello = ctk.CTkLabel(header, text="", font=theme.display(26), text_color=TEXT, anchor="w", height=34)
+        self.hello = Label(header, text="", font=theme.display(24), text_color=TEXT, anchor="w", height=36)
         self.hello.pack(fill="x")
-        self.today_label = ctk.CTkLabel(header, text="", font=theme.text(13), text_color=MUTED, anchor="w", height=20)
+        self.today_label = FitLabel(header, font=theme.text(13), text_color=MUTED, anchor="w", height=20, cursor="hand2")
         self.today_label.pack(fill="x")
+        self.today_label.bind("<Button-1>", lambda _: app.navigate("almanac"))
 
         self.quick = QuickEntry(self, app)
         self.quick.grid(row=1, column=0, sticky="ew", padx=24)
 
-        cards = ctk.CTkFrame(self, fg_color="transparent")
-        cards.grid(row=2, column=0, sticky="ew", padx=24, pady=(8, 12))
-        cards.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="kpi")
-        self.today_card = NumberCard(cards, "Hôm nay", Icon.TODAY, ACCENT, ACCENT_SOFT)
-        self.overdue_card = NumberCard(cards, "Quá hạn", Icon.WARNING, RED, RED_SOFT)
-        self.rate_card = RateCard(cards)
-        self.week_card = WeekCard(cards)
-        targets = ((self.today_card, "today"), (self.overdue_card, "today"), (self.rate_card, "done"), (self.week_card, "calendar"))
-        for column, (card, target) in enumerate(targets):
-            card.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0 if column == 3 else 6))
-            bind_click(card, lambda key=target: app.navigate(key))
+        self.stats = StatStrip(self, app)
+        self.stats.grid(row=2, column=0, sticky="ew", padx=24, pady=(8, 10))
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.grid(row=3, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        band = Card(self)
+        band.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 10))
+        self.band_title = Label(band, text="", font=theme.text(13), text_color=MUTED, anchor="w", height=20)
+        self.band_title.pack(fill="x", padx=14, pady=(8, 2))
+        self.band = DayBand(band, app)
+        self.band.pack(fill="x", padx=12, pady=(0, 10))
+
+        body = Plain(self)
+        body.grid(row=4, column=0, sticky="nsew", padx=24, pady=(0, 20))
         body.grid_columnconfigure(0, weight=3, uniform="body")
         body.grid_columnconfigure(1, weight=2, uniform="body")
         body.grid_rowconfigure(0, weight=1)
 
-        tasks_card = Card(body)
-        tasks_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        ctk.CTkLabel(tasks_card, text="Việc cần làm hôm nay", font=theme.semibold(15), text_color=TEXT, anchor="w", height=24).pack(
-            fill="x", padx=16, pady=(12, 4))
-        self.task_list = TaskList(tasks_card, app, self._select, app.open_task, EMPTY_TEXTS["today"])
-        self.task_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        tasks_column = Plain(body)
+        tasks_column.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        Label(tasks_column, text="Việc cần làm hôm nay", font=theme.semibold(16), text_color=TEXT, anchor="w", height=26).pack(fill="x", padx=4)
+        self.task_list = TaskList(tasks_column, app, self._select, app.open_task, EMPTY_TEXTS["today"])
+        self.task_list.pack(fill="both", expand=True)
 
-        side = ctk.CTkFrame(body, fg_color="transparent")
+        side = Plain(body)
         side.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         self.focus_card = FocusCard(side, app, self)
         self.focus_card.pack(fill="x")
         agenda = Card(side)
-        agenda.pack(fill="both", expand=True, pady=(12, 0))
-        ctk.CTkLabel(agenda, text="Mốc tiếp theo", font=theme.semibold(15), text_color=TEXT, anchor="w", height=24).pack(
-            fill="x", padx=16, pady=(12, 2))
-        self.deadline_title = ctk.CTkLabel(agenda, text="", font=theme.text(13), text_color=MUTED, anchor="w", height=20)
+        agenda.pack(fill="x", pady=(10, 0))
+        Label(agenda, text="Mốc tiếp theo", font=theme.semibold(16), text_color=TEXT, anchor="w", height=26).pack(
+            fill="x", padx=16, pady=(12, 0))
+        self.deadline_title = FitLabel(agenda, font=theme.text(13), text_color=MUTED, anchor="w", height=20)
         self.deadline_title.pack(fill="x", padx=16)
-        self.deadline_clock = ctk.CTkLabel(agenda, text="", font=theme.display(24), text_color=TEXT, anchor="w", height=34)
-        self.deadline_clock.pack(fill="x", padx=16)
-        ctk.CTkLabel(agenda, text="Khối giờ hôm nay", font=theme.text(12), text_color=MUTED, anchor="w", height=20).pack(
-            fill="x", padx=16, pady=(6, 0))
-        self.blocks = ctk.CTkLabel(agenda, text="", font=theme.text(13), text_color=TEXT, anchor="nw", justify="left")
-        self.blocks.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        self.deadline_clock = Label(agenda, text="", font=theme.display(24), text_color=TEXT, anchor="w", height=36)
+        self.deadline_clock.pack(fill="x", padx=16, pady=(0, 8))
+        self.saying = QuoteCard(side)
+        self.saying.pack(fill="x", pady=(10, 0))
+
+    def _fit(self, event):
+        """Cửa sổ thấp thì bớt phần phụ để danh sách việc và đồng hồ không bị cắt."""
+        scale = ScalingTracker.get_widget_scaling(self)
+        self.stats.fit(event.width / scale)
+        compact = event.height / scale < COMPACT_HEIGHT
+        if compact != self.compact:
+            self.compact = compact
+            self.focus_card.set_compact(compact)
+            if compact:
+                self.band_title.pack_forget()
+                self.saying.pack_forget()
+            else:
+                self.band_title.pack(fill="x", padx=14, pady=(8, 2), before=self.band)
+                self.saying.pack(fill="x", pady=(10, 0))
 
     def _select(self, task_id):
         self.selected_id = task_id
         self.focus_card.refresh(self.store.scheduled_tasks(), datetime.now())
 
     def refresh(self, now):
-        stats = self.store.stats(now)
-        self.hello.configure(text=greeting(now.hour))
-        self.today_label.configure(text=f"{WEEKDAY_LONG[now.weekday()]}, {now:%d/%m/%Y} · {lunar_text(solar_to_lunar(now.date()))} âm lịch")
-        self.today_card.show(stats["today_open"], f"còn lại · {stats['done_today']} đã xong")
-        overdue = stats["overdue"]
-        self.overdue_card.show(overdue, "cần xử lý ngay" if overdue else "Không có việc trễ", RED if overdue else GREEN)
-        self.rate_card.show(stats)
-        self.week_card.show(stats["week"])
-        self.task_list.set_entries(group_entries(self.store.list_tasks("today", now), now, "today"))
+        reading = daybook.read_day(now.date())
+        set_label(self.hello, text=f"{greeting(now.hour)}, {WEEKDAY_LONG[now.weekday()].lower()} {now.day} tháng {now.month}")
+        marks = ", ".join(mark.name for mark in reading.marks[:3])
+        self.today_label.set_text(f"{lunar_text(solar_to_lunar(now.date()))} âm lịch · {reading.title}" + (f", phạm {marks}" if marks else ""))
+        self.stats.show(self.app.stats)
+        self.task_list.set_entries(group_entries(self.store.list_tasks("today", now), now, "today", self.store.list_tasks("done_today", now)))
         self.task_list.select(self.selected_id)
-        self.focus_card.refresh(self.store.scheduled_tasks(), now)
+        tasks = self.store.scheduled_tasks()
+        self.focus_card.refresh(tasks, now)
         self.deadline = self.store.nearest_deadline(now)
-        if self.deadline:
-            title = self.deadline["title"]
-            self.deadline_title.configure(text=title if len(title) <= 40 else title[:39] + "…")
-        else:
-            self.deadline_title.configure(text="Không có hạn nào sắp tới")
-            self.deadline_clock.configure(text="")
-        rows = self.store.blocks_today(now)
-        lines = []
-        for row in rows[:MAX_BLOCK_LINES]:
-            start, end = block_window(row)
-            lines.append(f"{start:%H:%M}–{end:%H:%M}   {row['title'][:30]}")
-        if len(rows) > MAX_BLOCK_LINES:
-            lines.append(f"+{len(rows) - MAX_BLOCK_LINES} khối khác")
-        self.blocks.configure(text="\n".join(lines) or "Chưa đặt khối giờ nào", text_color=TEXT if lines else MUTED)
+        self.deadline_title.set_text(self.deadline["title"] if self.deadline else "Không có hạn nào sắp tới")
+        if not self.deadline:
+            set_label(self.deadline_clock, text="")
+        good = ", ".join(slot.name for slot in daybook.hours_of(now.date()) if slot.good)
+        set_label(self.band_title, text=f"Giờ hoàng đạo hôm nay: {good}")
+        self.band.show(now, tasks, self.store.blocks_today(now))
+        self.saying.show(now.date(), quotes.chosen_topics(self.store.setting("quote_topics")))
         self.tick(now)
 
     def tick(self, now):
         self.focus_card.tick(now)
         if self.deadline:
-            left = from_text(self.deadline["due_at"]) - now
+            due = from_text(self.deadline["due_at"])
+            left = due - now
             if left.total_seconds() <= 0:
                 self.app.refresh()
                 return
-            text = f"{left.days} ngày {countdown(left - timedelta(days=left.days))}" if left.days else countdown(left)
-            self.deadline_clock.configure(text=text, text_color=AMBER if left < timedelta(hours=1) else TEXT)
+            if self.deadline["all_day"]:
+                text = "Hết hôm nay" if due.date() == now.date() else f"{due:%d/%m}, còn {(due.date() - now.date()).days} ngày"
+            else:
+                text = f"{left.days} ngày {countdown(left - timedelta(days=left.days))}" if left.days else countdown(left)
+            set_label(self.deadline_clock, text=text, text_color=AMBER if left < timedelta(hours=1) else TEXT)
 
 
 class TasksPage(ctk.CTkFrame):
@@ -315,26 +451,28 @@ class TasksPage(ctk.CTkFrame):
         self.search_text = ""
         self.editor = None  # panel khá nặng nên chỉ dựng khi mở lần đầu
         self.editor_open = False
+        self.title_text = ""
+        self.search_narrow = False
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
+        Plain(self, width=24, height=1).grid(row=0, column=2)  # lề phải giữ nguyên dù panel chi tiết đóng hay mở
 
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=(24, 12), pady=(18, 8))
-        self.title_label = ctk.CTkLabel(header, text="", font=theme.display(25), text_color=TEXT, anchor="w", height=34)
-        self.title_label.pack(side="left")
-        self.count_label = ctk.CTkLabel(header, text="", font=theme.text(14), text_color=MUTED, height=34)
-        self.count_label.pack(side="left", padx=(10, 0), pady=(4, 0))
-        self.search = field(header, width=170, placeholder_text="Tìm kiếm…   (Ctrl+F)")
-        self.search.pack(side="right")
+        self.header = header = Plain(self)
+        header.grid(row=0, column=0, sticky="ew", padx=(24, 0), pady=(18, 8))
+        header.bind("<Configure>", self._fit_header)
+        self.search = field(header, width=SEARCH_WIDTH, placeholder_text=SEARCH_HINT)
+        self.search.pack(side="right")  # xếp trước để không bị bóp khi thiếu chỗ
         self.search.bind("<KeyRelease>", self._on_search)
+        self.title_label = Label(header, text="", font=theme.display(24), text_color=TEXT, anchor="w", height=36)
+        self.title_label.pack(side="left")
+        self.count_label = Label(header, text="", font=theme.text(14), text_color=MUTED, height=34)
+        self.count_label.pack(side="left", padx=(10, 0), pady=(4, 0))
 
         self.quick = QuickEntry(self, app)
-        self.quick.grid(row=1, column=0, sticky="ew", padx=(24, 12))
+        self.quick.grid(row=1, column=0, sticky="ew", padx=(24, 0))
 
-        card = Card(self)
-        card.grid(row=2, column=0, sticky="nsew", padx=(24, 12), pady=(8, 20))
-        self.task_list = TaskList(card, app, self._select)
-        self.task_list.pack(fill="both", expand=True, padx=8, pady=8)
+        self.task_list = TaskList(self, app, self._select)
+        self.task_list.grid(row=2, column=0, sticky="nsew", padx=(24, 0), pady=(4, 20))
 
     def show_view(self, view, tag_id=0, tag_name=""):
         self.view, self.tag_id, self.tag_name = view, tag_id, tag_name
@@ -342,10 +480,24 @@ class TasksPage(ctk.CTkFrame):
         self.search_text = ""
         self.refresh(datetime.now())
 
+    def _fit_header(self, _event=None):
+        """Panel chi tiết mở trên cửa sổ nhỏ thì ô tìm kiếm thu lại, tên dài (như tên tag) tự cắt bằng dấu ba chấm."""
+        scale = ScalingTracker.get_widget_scaling(self)
+        width = self.header.winfo_width()
+        narrow = width / scale < SEARCH_NARROW_BELOW
+        if narrow != self.search_narrow:
+            self.search_narrow = narrow
+            self.search.configure(width=SEARCH_WIDTH_NARROW if narrow else SEARCH_WIDTH, placeholder_text=SEARCH_HINT_NARROW if narrow else SEARCH_HINT)
+        room = width - round(((SEARCH_WIDTH_NARROW if narrow else SEARCH_WIDTH) + 16) * scale) - self.count_label.winfo_reqwidth() - round(10 * scale)
+        font = theme.display(24)
+        shown = fit_text(lambda piece: measure_text(font, scale, piece), self.title_text, room) if room > 0 else self.title_text
+        set_label(self.title_label, text=shown)
+
     def refresh(self, now):
-        self.title_label.configure(text=self.tag_name or VIEW_TITLES[self.view])
+        self.title_text = self.tag_name or VIEW_TITLES[self.view]
         tasks = self.store.list_tasks(self.view, now, self.tag_id, self.search_text)
         self.count_label.configure(text=str(len(tasks)) if tasks else "")
+        self._fit_header()
         self.task_list.empty_text = "Không tìm thấy việc nào." if self.search_text else EMPTY_TEXTS[self.view]
         self.task_list.set_entries(group_entries(tasks, now, self.view))
 
@@ -359,15 +511,25 @@ class TasksPage(ctk.CTkFrame):
         self.open_editor(task_id)
 
     def open_editor(self, task_id):
+        """Mở panel thì cả vùng nội dung mờ dần, đổi việc khi panel đang mở thì chỉ panel mờ dần."""
+        opening = not self.editor_open
+        with self.app.fade(None if opening else self.editor, when=opening or task_id != self.editor.task_id):
+            self._open_editor(task_id)
+
+    def _open_editor(self, task_id):
         if self.editor is None:
             self.editor = TaskEditor(self, self.app)
         if not self.editor_open:
-            self.editor.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(0, 24), pady=(18, 20))
+            self.editor.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(12, 0), pady=(18, 20))
             self.editor_open = True
         self.task_list.select(task_id)
         self.editor.load(task_id)
 
     def close_editor(self):
+        with self.app.fade(when=self.editor_open):
+            self._close_editor()
+
+    def _close_editor(self):
         if self.editor_open:
             self.editor.grid_remove()
             self.editor_open = False
@@ -381,23 +543,52 @@ class SettingsPage(ctk.CTkFrame):
         super().__init__(master, fg_color=BG)
         self.app = app
         self.store = app.store
+        self.brief_status = None
         self.brief_status_shown = None
-        ctk.CTkLabel(self, text="Cài đặt", font=theme.display(25), text_color=TEXT, anchor="w", height=34).pack(
-            fill="x", padx=24, pady=(18, 10))
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=TRACK,
-                                        scrollbar_button_hover_color=MUTED)
+        header = Plain(self)
+        header.pack(fill="x", padx=24, pady=(18, 10))
+        self.tabs = segmented(header, list(SETTING_TABS), self._show_tab, dynamic_resizing=False, width=360)
+        self.tabs.pack(side="right")
+        Label(header, text="Cài đặt", font=theme.display(24), text_color=TEXT, anchor="w", height=36).pack(side="left")
+        scroll = motion.ScrollFrame(self, BG)
         scroll.pack(fill="both", expand=True, padx=(16, 8), pady=(0, 16))
         self.scroll = scroll
+        self.pages = {name: Plain(scroll) for name in SETTING_TABS}
+        self.builders = dict(zip(SETTING_TABS, (self._build_general, self._build_notices, self._build_telegram, self._build_ai)))
+        self.tab = None
+        self._show_tab(SETTING_TABS[0])
 
+    def _build_general(self):
         section = self._section("Giao diện")
         row = self._row(section, "Chủ đề màu", "Tối là nền đen, nhấn xanh dương, độ tương phản cao")
         labels = {"Tối": "dark", "Sáng": "light", "Hệ thống": "system"}
         self.theme_choice = segmented(row, list(labels), lambda label: self._set_theme(labels[label]))
         self.theme_choice.pack(side="right")
         self.theme_choice.set(next(k for k, v in labels.items() if v == self.store.setting("theme")))
+        row = self._row(section, "Cỡ chữ", "Phóng to chữ và khoảng cách trong toàn bộ cửa sổ")
+        self.text_choice = segmented(row, list(theme.TEXT_SCALES), lambda label: self.app.set_text_scale(theme.TEXT_SCALES[label]))
+        self.text_choice.pack(side="right")
+        self.text_choice.set(next(k for k, v in theme.TEXT_SCALES.items() if v == self.store.setting("text_scale")))
+
+        section = self._section("Câu nói hôm nay")
+        Label(section, text="Chủ đề", font=theme.text(14), text_color=TEXT, anchor="w", height=22).pack(fill="x", padx=16, pady=(10, 0))
+        total = sum(len(items) for *_, items in quotes.TOPICS)
+        note = Label(section, text=f"{total} câu chia {len(quotes.TOPICS)} chủ đề. Mỗi ngày Tổng quan hiện một câu ngẫu nhiên trong các chủ đề "
+                     "đang chọn, ghi rõ tác giả", font=theme.text(12), text_color=MUTED, anchor="w", justify="left", height=18, elastic=True)
+        note.pack(fill="x", padx=16)
+        section.bind("<Configure>", lambda event: self._wrap(note, event.width - round(32 * ScalingTracker.get_widget_scaling(self))), add="+")
+        chips = Plain(section)
+        chips.pack(fill="x", padx=16, pady=(8, 12))
+        chosen = quotes.chosen_topics(self.store.setting("quote_topics"))
+        self.topic_chips = {}
+        for index, (key, _name, label, _items) in enumerate(quotes.TOPICS):  # chip là một Canvas, sáu dòng công tắc là gần 60 cửa sổ Tk
+            chip = Chip(chips, label, lambda key=key: self._toggle_topic(key))
+            chip.set_active(key in chosen)
+            chip.grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 6), pady=(0, 6))
+            self.topic_chips[key] = chip
 
         section = self._section("Tag")
-        self.tag_rows = ctk.CTkFrame(section, fg_color="transparent")
+        self.tag_rows = Plain(section)
         self.tag_rows.pack(fill="x", padx=16, pady=(10, 0))
         self.new_tag = field(section, placeholder_text="+ Tạo tag mới, Enter để lưu")
         self.new_tag.pack(fill="x", padx=16, pady=(4, 12))
@@ -412,6 +603,13 @@ class SettingsPage(ctk.CTkFrame):
         row = self._row(section, "Đồng hồ đếm ngược nổi", "Hiện góc màn hình khi khối thời gian đang chạy")
         self._switch(row, self.store.setting("timer_pill") == "1", lambda on: self._set_flag("timer_pill", on))
 
+        section = self._section("Dữ liệu")
+        row = self._row(section, "Thư mục dữ liệu", DATA_DIR if len(DATA_DIR) <= 72 else "…" + DATA_DIR[-71:])
+        secondary_button(row, "Mở thư mục", lambda: os.startfile(DATA_DIR), width=104).pack(side="right")
+        Label(self.page, text=f"{APP_NAME} {__version__}", font=theme.text(12), text_color=MUTED, anchor="w").pack(
+            fill="x", padx=8, pady=(10, 0))
+
+    def _build_notices(self):
         section = self._section("Thông báo")
         row = self._row(section, "Giờ gửi tóm tắt mỗi sáng", "Dành cho PC bật xuyên đêm, định dạng HH:MM")
         self.summary_time = field(row, width=76, justify="center")
@@ -430,20 +628,39 @@ class SettingsPage(ctk.CTkFrame):
         row = self._row(section, "Gửi tóm tắt ngay", "Dùng để kiểm tra thông báo Windows có bị chặn không")
         secondary_button(row, "Gửi thử", lambda: post_agent(WM_APP_SUMMARY), width=84).pack(side="right")
 
-        self._build_telegram()
-        self._build_ai()
+    def _show_tab(self, name):
+        """Mỗi tab chỉ được dựng khi mở lần đầu: cả bốn tab có gần 400 widget mà thường chỉ cần một."""
+        with self.app.fade(when=self.tab is not None and name != self.tab):
+            self._switch_tab(name)
 
-        section = self._section("Dữ liệu")
-        row = self._row(section, "Thư mục dữ liệu", DATA_DIR if len(DATA_DIR) <= 72 else "…" + DATA_DIR[-71:])
-        secondary_button(row, "Mở thư mục", lambda: os.startfile(DATA_DIR), width=104).pack(side="right")
-        ctk.CTkLabel(scroll, text=f"{APP_NAME} {__version__}", font=theme.text(12), text_color=MUTED, anchor="w").pack(
-            fill="x", padx=8, pady=(10, 0))
+    def _switch_tab(self, name):
+        self.tab = name
+        self.tabs.set(name)
+        if name in self.builders:
+            self.page = self.pages[name]
+            self.builders.pop(name)()
+        for page in self.pages.values():
+            page.pack_forget()
+        self.pages[name].pack(fill="x")
+        self.scroll.scroller.halt()
+        self.scroll._parent_canvas.yview_moveto(0)
 
     def _build_telegram(self):
         store = self.store
         section = self._section("Bot Telegram")
-        row = self._row(section, "Bản tin mỗi ngày", "Thần tâu lên hoàng thượng qua Telegram, mỗi ngày một lần")
+        row = self._row(section, "Bản tin mỗi ngày", "Thần dâng tờ tấu lên Bệ hạ qua Telegram, mỗi ngày một lần")
         self._switch(row, store.setting("telegram_enabled") == "1", self._set_brief_enabled)
+        row = self._row(section, "Nhận tin nhắn và lệnh", "Nhắn việc cho bot, mỗi dòng một việc; /rp, /today, /week để xem tình hình. "
+                        "PC cần đang bật và TodoLite đang chạy")
+        self._switch(row, store.setting("telegram_inbox") == "1", self._set_inbox)
+        row = self._row(section, "Nhắc trước hạn", "Bot nhắn trước hạn chót của việc có giờ. Chọn được nhiều mốc, bỏ chọn hết là tắt")
+        self.telegram_chips = {}
+        chosen = parse_offsets(store.setting("telegram_remind"))
+        for minutes in reversed(TELEGRAM_CHOICES):
+            chip = Chip(row, TELEGRAM_LABELS[minutes], lambda m=minutes: self._toggle_telegram_remind(m), width=48)
+            chip.set_active(minutes in chosen)
+            chip.pack(side="right", padx=(6, 0))
+            self.telegram_chips[minutes] = chip
         row = self._row(section, "Bot Token", "Nhắn @BotFather để tạo bot. Token được mã hoá trên máy này")
         self._secret_field(row, "telegram_token", "123456:ABC-DEF…")
         row = self._row(section, "Chat ID", "Nhắn /start cho bot rồi bấm Lấy tự động")
@@ -469,8 +686,10 @@ class SettingsPage(ctk.CTkFrame):
         self.send_button.pack(side="right")
         self.check_button = secondary_button(row, "Kiểm tra bot", self._check_bot, width=104)
         self.check_button.pack(side="right", padx=(0, 6))
-        self.brief_status = ctk.CTkLabel(section, text="", font=theme.text(12), text_color=MUTED, anchor="w", justify="left", wraplength=620)
+        self.brief_status = Label(section, text="", font=theme.text(12), text_color=MUTED, anchor="w", justify="left", wraplength=620, elastic=True)
         self.brief_status.pack(fill="x", padx=16, pady=(0, 10))
+        section.bind("<Configure>", lambda event: self._wrap(self.brief_status, event.width - round(32 * ScalingTracker.get_widget_scaling(self))),
+                     add="+")
         self.refresh(None)
 
     def _build_ai(self):
@@ -487,24 +706,33 @@ class SettingsPage(ctk.CTkFrame):
         self.ai_model.bind("<Return>", self._save_ai_model)
 
     def _section(self, title):
-        ctk.CTkLabel(self.scroll, text=title, font=theme.semibold(15), text_color=TEXT, anchor="w", height=24).pack(
+        Label(self.page, text=title, font=theme.semibold(16), text_color=TEXT, anchor="w", height=26).pack(
             fill="x", padx=8, pady=(10, 4))
-        card = Card(self.scroll)
+        card = Card(self.page)
         card.pack(fill="x", padx=(8, 8), pady=(0, 6))
         return card
 
     def _row(self, card, title, note):
-        row = ctk.CTkFrame(card, fg_color="transparent")
+        """Một dòng cài đặt, trả về khung bên phải để đặt điều khiển. Khung phải giữ đủ chỗ, ghi chú dài thì tự xuống dòng."""
+        row = Plain(card)
         row.pack(fill="x", padx=16, pady=8)
-        labels = ctk.CTkFrame(row, fg_color="transparent")
-        labels.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(labels, text=title, font=theme.text(14), text_color=TEXT, anchor="w", height=20).pack(fill="x")
-        ctk.CTkLabel(labels, text=note, font=theme.text(12), text_color=MUTED, anchor="w", height=18).pack(fill="x")
-        return row
+        row.grid_columnconfigure(0, weight=1)
+        labels = Plain(row)
+        labels.grid(row=0, column=0, sticky="ew", padx=(0, 16))
+        Label(labels, text=title, font=theme.text(14), text_color=TEXT, anchor="w", height=22).pack(fill="x")
+        hint = Label(labels, text=note, font=theme.text(12), text_color=MUTED, anchor="w", justify="left", height=18, elastic=True)
+        hint.pack(fill="x")
+        labels.bind("<Configure>", lambda event: self._wrap(hint, event.width))
+        controls = Plain(row)
+        controls.grid(row=0, column=1, sticky="e")
+        return controls
+
+    def _wrap(self, label, width):
+        set_label(label, wraplength=round(width / ScalingTracker.get_widget_scaling(self)))
 
     def _switch(self, row, value, command):
-        switch = ctk.CTkSwitch(row, text="", width=44, progress_color=FILL, fg_color=TRACK,
-                               command=lambda: command(switch.get() == 1))
+        switch = ctk.CTkSwitch(row, text="", width=44, progress_color=FILL, fg_color=theme.SWITCH_OFF, button_color=theme.SWITCH_KNOB,
+                               button_hover_color=theme.SWITCH_KNOB, command=lambda: command(switch.get() == 1))
         if value:
             switch.select()
         switch.pack(side="right")
@@ -519,7 +747,7 @@ class SettingsPage(ctk.CTkFrame):
             self._tag_row(tag)
 
     def _tag_row(self, tag):
-        row = ctk.CTkFrame(self.tag_rows, fg_color="transparent")
+        row = Plain(self.tag_rows)
         row.pack(fill="x", pady=(0, 6))
         tag_id, color = tag["id"], tag["color"]
         ctk.CTkButton(row, text="", width=24, height=24, corner_radius=12, fg_color=color, hover_color=color,
@@ -529,7 +757,7 @@ class SettingsPage(ctk.CTkFrame):
         name.pack(side="left", fill="x", expand=True)
         name.bind("<Return>", lambda _: self._rename_tag(tag_id, name))
         name.bind("<FocusOut>", lambda _: self._rename_tag(tag_id, name))
-        ctk.CTkLabel(row, text=f"{tag['n']} việc" if tag["n"] else "", width=56, font=theme.text(12), text_color=MUTED).pack(side="left", padx=(8, 0))
+        Label(row, text=f"{tag['n']} việc" if tag["n"] else "", width=60, font=theme.text(12), text_color=MUTED).pack(side="left", padx=(8, 0))
         IconButton(row, Icon.DELETE, lambda: self._delete_tag(tag_id, tag["name"]), size=30).pack(side="left")
 
     def _next_color(self, tag_id, color):
@@ -567,12 +795,22 @@ class SettingsPage(ctk.CTkFrame):
     # ---------- Tuỳ chọn khác ----------
 
     def _set_theme(self, value):
-        self.store.set_setting("theme", value)
-        ctk.set_appearance_mode(value)
-        self.app.apply_caption_color()
+        with self.app.fade(self.app):
+            self.store.set_setting("theme", value)
+            self.app.set_theme(value)
+            self.app.apply_caption_color()
 
     def _set_autostart(self, enabled):
         integration.set_autostart(enabled)
+
+    def _toggle_topic(self, key):
+        chip = self.topic_chips[key]
+        if chip.active and sum(item.active for item in self.topic_chips.values()) == 1:
+            self.app.snackbar.show("Cần giữ ít nhất một chủ đề")  # bỏ hết thì không còn câu nào để hiện
+            return
+        chip.set_active(not chip.active)
+        self.store.set_setting("quote_topics", ",".join(name for name, item in self.topic_chips.items() if item.active))
+        self.app.changed()
 
     def _set_flag(self, key, enabled):
         self.store.set_setting(key, "1" if enabled else "0")
@@ -596,11 +834,18 @@ class SettingsPage(ctk.CTkFrame):
         chosen = [str(value) for value in REMIND_CHOICES if self.remind_chips[value].active]
         self.store.set_setting("default_remind", ",".join(reversed(chosen)))
 
+    def _toggle_telegram_remind(self, minutes):
+        chip = self.telegram_chips[minutes]
+        chip.set_active(not chip.active)
+        chosen = [str(value) for value in TELEGRAM_CHOICES if self.telegram_chips[value].active]
+        self.store.set_setting("telegram_remind", ",".join(reversed(chosen)))
+        self.app.changed()  # agent tính lại mốc thức dậy
+
     # ---------- Bot Telegram và AI ----------
 
     def refresh(self, _now):
         status = self.store.setting("telegram_status")
-        if status != self.brief_status_shown:
+        if self.brief_status is not None and status != self.brief_status_shown:
             self.brief_status_shown = status
             self._show_brief_status(status or "Chưa gửi bản tin nào")
 
@@ -658,6 +903,7 @@ class SettingsPage(ctk.CTkFrame):
         ready = self._brief_ready()
         self.store.set_secret(key, value)
         if key == "telegram_token":
+            self.store.set_setting("telegram_commands", "")  # bot mới chưa có menu lệnh
             self._brief_setup_changed(ready)
 
     def _brief_ready(self):
@@ -675,6 +921,11 @@ class SettingsPage(ctk.CTkFrame):
         ready = self._brief_ready()
         self.store.set_setting("telegram_enabled", "1" if enabled else "0")
         self._brief_setup_changed(ready)
+
+    def _set_inbox(self, enabled):
+        if enabled:
+            self.store.set_setting("telegram_inbox_since", int(time.time()))  # tin nhắn lúc tắt không thành việc
+        self._set_flag("telegram_inbox", enabled)
 
     def _save_chat_id(self, _event=None):
         value = self.chat_id.get().strip()
@@ -707,16 +958,30 @@ class SettingsPage(ctk.CTkFrame):
 
     def _bot_maker(self):
         """Hàm tạo Bot để gọi trong luồng phụ: khoá phải đọc từ luồng giao diện, nơi giữ kết nối SQLite."""
-        from ..telegram import Bot
+        from ..bot import Bot
         token, url = self.store.secret("telegram_token"), self.store.setting("telegram_api_url")
         return lambda: Bot(token, url)
 
     def _check_bot(self):
+        from ..web import ApiError
         make_bot = self._bot_maker()
         self._show_brief_status("Đang kiểm tra…")
-        self._in_background(self.check_button, lambda: make_bot().me(), self._on_checked)
 
-    def _on_checked(self, name, error):
+        def check():
+            bot = make_bot()
+            name = bot.me()
+            try:
+                bot.set_commands()  # kiểm tra xong là có ngay menu lệnh khi gõ "/" trong Telegram
+            except ApiError:
+                return name, False
+            return name, True
+        self._in_background(self.check_button, check, self._on_checked)
+
+    def _on_checked(self, result, error):
+        name, menu = result or (None, False)
+        if menu:
+            from ..bot import COMMANDS_VERSION
+            self.store.set_setting("telegram_commands", COMMANDS_VERSION)
         self._show_brief_status(f"Bot {name} đã sẵn sàng" if name else error, GREEN if name else RED)
 
     def _send_test(self):

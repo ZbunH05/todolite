@@ -43,6 +43,12 @@ def main(argv):
         elif command == "--telegram":
             from .telegram import main as send_telegram
             send_telegram()
+        elif command == "--telegram-inbox":
+            from .inbox import main as read_inbox
+            read_inbox()
+        elif command == "--telegram-remind":
+            from .remind import main as send_reminders
+            send_reminders()
         elif command == "--quit":
             stop_agent()
         else:

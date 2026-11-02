@@ -1,17 +1,18 @@
-"""Hai cửa sổ native của agent, vẽ bằng GDI nên không cần nạp giao diện nặng:
+"""Ba cửa sổ native của agent, vẽ bằng GDI nên không cần nạp giao diện nặng:
 
 - QuickAdd: ô nhập nhanh hiện tức thì khi bấm Ctrl+Alt+T ở bất kỳ đâu.
-- TimerPill: đồng hồ đếm ngược nổi, còn đó cả khi đã đóng Dashboard.
+- TimerPill: đồng hồ đếm ngược nổi của khối giờ hoặc Pomodoro, còn đó cả khi đã đóng cửa sổ chính.
 - ReminderCard: thẻ nhắc việc có nút Xong, Báo lại, Mở; ở lại tới khi được xử lý.
 """
 import winreg
+from collections import namedtuple
 from ctypes import byref, create_unicode_buffer
 from ctypes import wintypes as w
 from datetime import datetime
 
 from . import APP_NAME
-from .paths import ICON_PATH
-from .schedule import countdown, describe_event
+from .paths import FONT_PATHS, ICON_PATH
+from .schedule import countdown, countdown_up, describe_event
 from .win32 import *  # noqa: F403
 
 HOTKEY_HINT = "Ví dụ: Nộp báo cáo mai 9h !1 #công-việc   ·   Enter lưu   ·   Esc đóng"
@@ -21,12 +22,17 @@ FONT_ICONS = "Segoe Fluent Icons"
 GLYPH_CLOSE = "\ue711"
 SNOOZE_MINUTES = 10
 EXTEND_MINUTES = 10
+_fonts_loaded = False
+
+# Thứ đồng hồ nổi đang đếm. kind: block | pomo; stamp đổi khi khối giờ hay phiên đổi, dùng để nhớ người dùng đã ẩn đồng hồ;
+# rest: giờ nghỉ của Pomodoro, thanh tiến độ màu xanh lá.
+PillItem = namedtuple("PillItem", "kind title start end stamp task_id rest")
 
 # Cùng bảng màu với giao diện chính (ui/theme.py); agent không nạp được module đó vì nó cần CustomTkinter.
 _LIGHT = {"bg": "#FFFFFF", "text": "#0A1324", "muted": "#46556E", "accent": "#1F5FE0", "track": "#D9E2F0",
-          "on_accent": "#FFFFFF", "accent_hover": "#1A52C4", "track_hover": "#C6D3E8", "link": "#1456CC"}
+          "on_accent": "#FFFFFF", "accent_hover": "#1A52C4", "track_hover": "#C6D3E8", "link": "#1456CC", "green": "#0B7342"}
 _DARK = {"bg": "#0C1322", "text": "#F4F7FF", "muted": "#A9BAD6", "accent": "#1F6FEB", "track": "#1E2C47",
-         "on_accent": "#FFFFFF", "accent_hover": "#1A60D0", "track_hover": "#2B3D60", "link": "#6CB6FF"}
+         "on_accent": "#FFFFFF", "accent_hover": "#1A60D0", "track_hover": "#2B3D60", "link": "#6CB6FF", "green": "#45E08A"}
 
 
 def palette(theme):
@@ -41,9 +47,24 @@ def palette(theme):
     return {name: colorref(value) for name, value in (_DARK if dark else _LIGHT).items()}
 
 
-def _font(size, dpi, weight=FW_NORMAL, family=FONT_FAMILY):
+def _load_fonts():
+    """Nạp font đi kèm khi popup đầu tiên hiện: ngày nào không có popup thì agent không tốn gì. Lỗi thì giữ font Windows."""
+    global _fonts_loaded, FONT_FAMILY, FONT_SEMIBOLD
+    if not _fonts_loaded:
+        _fonts_loaded = True
+        if load_private_fonts(FONT_PATHS):
+            FONT_FAMILY, FONT_SEMIBOLD = "Be Vietnam Pro", "Be Vietnam Pro SemiBold"
+
+
+def _text_dpi(hwnd, store):
+    """DPI dùng để tính cỡ popup: DPI màn hình nhân với tuỳ chọn Cỡ chữ, nên chữ và khung lớn cùng nhau."""
+    _load_fonts()
+    return GetDpiForWindow(hwnd) * float(store.setting("text_scale"))
+
+
+def _font(size, dpi, family=None):
     height = -round(size * dpi / 72)
-    return CreateFontW(height, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, family)
+    return CreateFontW(height, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, family or FONT_FAMILY)
 
 
 def _draw_text(dc, text, rect, color, flags):
@@ -60,7 +81,7 @@ def _work_area(x, y):
 
 class QuickAdd:
     CLASS = "TodoLiteQuickAdd"
-    WIDTH, HEIGHT = 640, 92
+    WIDTH, HEIGHT = 640, 96
 
     def __init__(self, agent):
         self.agent = agent
@@ -80,7 +101,7 @@ class QuickAdd:
         area = _work_area(cursor.x, cursor.y)
         self.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, self.CLASS, f"{APP_NAME} Quick Add", WS_POPUP,
                                     area.left, area.top, 1, 1, None, None, HINSTANCE, None)
-        dpi = GetDpiForWindow(self.hwnd)
+        dpi = _text_dpi(self.hwnd, self.agent.store)
         self.scale = dpi / 96
         width, height = round(self.WIDTH * self.scale), round(self.HEIGHT * self.scale)
         x = (area.left + area.right - width) // 2
@@ -90,8 +111,8 @@ class QuickAdd:
         self.background = CreateSolidBrush(self.colors["bg"])
         self.input_font, self.hint_font = _font(14, dpi), _font(9.5, dpi)
         margin = round(18 * self.scale)
-        self.edit = CreateWindowExW(0, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, margin, round(16 * self.scale),
-                                    width - 2 * margin, round(30 * self.scale), self.hwnd, None, HINSTANCE, None)
+        self.edit = CreateWindowExW(0, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, margin, round(14 * self.scale),
+                                    width - 2 * margin, round(34 * self.scale), self.hwnd, None, HINSTANCE, None)
         SendMessageW(self.edit, WM_SETFONT, self.input_font, 1)
         ShowWindow(self.hwnd, SW_SHOWNORMAL)
         SetForegroundWindow(self.hwnd)
@@ -151,7 +172,7 @@ class QuickAdd:
         GetClientRect(self.hwnd, byref(rect))
         FillRect(dc, byref(rect), self.background)
         margin = round(20 * self.scale)
-        line = w.RECT(margin, round(52 * self.scale), rect.right - margin, round(80 * self.scale))
+        line = w.RECT(margin, round(54 * self.scale), rect.right - margin, round(84 * self.scale))
         SetBkMode(dc, TRANSPARENT)
         previous = SelectObject(dc, self.hint_font)
         if self.preview:
@@ -190,24 +211,24 @@ class TimerPill:
     CLASS = "TodoLiteTimerPill"
     WIDTH, HEIGHT = 280, 48
     TIMER_ID = 1
-    MENU_EXTEND, MENU_FINISH, MENU_HIDE = 1, 2, 3
+    MENU_EXTEND, MENU_FINISH, MENU_HIDE, MENU_PAUSE, MENU_SKIP, MENU_STOP = 1, 2, 3, 4, 5, 6
 
     def __init__(self, agent):
         self.agent = agent
         self.hwnd = None
-        self.block = None
+        self.item = None
         self.hidden_stamp = None
         self._procedure = WNDPROC(self._window_proc)
         register_window_class(self.CLASS, self._procedure, CS_DBLCLKS | CS_DROPSHADOW)
 
-    def sync(self, block):
-        """block: (task, bắt đầu, kết thúc) hoặc None."""
-        enabled = block is not None and self.agent.store.setting("timer_pill") == "1"
-        if not enabled or block[0]["block_start"] == self.hidden_stamp:
-            self.block = None
+    def sync(self, item):
+        """item: PillItem đang đếm, hoặc None."""
+        enabled = item is not None and self.agent.store.setting("timer_pill") == "1"
+        if not enabled or item.stamp == self.hidden_stamp:
+            self.item = None
             self._destroy()
             return
-        self.block = block
+        self.item = item
         if self.hwnd:
             InvalidateRect(self.hwnd, None, False)
         else:
@@ -227,13 +248,13 @@ class TimerPill:
         self.colors = palette(self.agent.store.setting("theme"))
         style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         self.hwnd = CreateWindowExW(style, self.CLASS, f"{APP_NAME} Timer", WS_POPUP, 0, 0, 1, 1, None, None, HINSTANCE, None)
-        dpi = GetDpiForWindow(self.hwnd)
+        dpi = _text_dpi(self.hwnd, self.agent.store)
         self.scale = dpi / 96
         width, height = round(self.WIDTH * self.scale), round(self.HEIGHT * self.scale)
         x, y = self._position(width, height)
         SetWindowPos(self.hwnd, None, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE)
         set_window_rounded(self.hwnd)
-        self.time_font, self.title_font = _font(14, dpi, FW_SEMIBOLD), _font(9.5, dpi)
+        self.time_font, self.title_font = _font(14, dpi, FONT_SEMIBOLD), _font(9.5, dpi)
         self.brushes = {name: CreateSolidBrush(color) for name, color in self.colors.items()}
         ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         SetTimer(self.hwnd, self.TIMER_ID, 1000, None)
@@ -258,37 +279,38 @@ class TimerPill:
         bitmap = CreateCompatibleBitmap(target, rect.right, rect.bottom)
         old_bitmap = SelectObject(dc, bitmap)
         FillRect(dc, byref(rect), self.brushes["bg"])
-        if self.block:
-            self._draw_block(dc, rect)
+        if self.item:
+            self._draw_item(dc, rect)
         BitBlt(target, 0, 0, rect.right, rect.bottom, dc, 0, 0, SRCCOPY)
         SelectObject(dc, old_bitmap)
         DeleteObject(bitmap)
         DeleteDC(dc)
         EndPaint(self.hwnd, byref(paint))
 
-    def _draw_block(self, dc, rect):
-        task, start, end = self.block
+    def _draw_item(self, dc, rect):
+        item = self.item
+        start, end = item.start, item.end
         now = datetime.now()
         left, gap = round(16 * self.scale), round(10 * self.scale)
         bar = round(3 * self.scale)
         SetBkMode(dc, TRANSPARENT)
         previous = SelectObject(dc, self.time_font)
-        text = countdown(end - now)
+        text = (countdown_up if item.kind == "pomo" else countdown)(end - now)  # cùng cách làm tròn với trang Pomodoro
         measure = w.RECT(0, 0, rect.right, rect.bottom - bar)
         DrawTextW(dc, text, -1, byref(measure), DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT)
         area = w.RECT(left, 0, left + measure.right, rect.bottom - bar)
         _draw_text(dc, text, area, self.colors["text"], DT_LEFT)
         SelectObject(dc, self.title_font)
         area = w.RECT(area.right + gap, 0, rect.right - left, rect.bottom - bar)
-        _draw_text(dc, task["title"], area, self.colors["muted"], DT_LEFT | DT_END_ELLIPSIS)
+        _draw_text(dc, item.title, area, self.colors["muted"], DT_LEFT | DT_END_ELLIPSIS)
         SelectObject(dc, previous)
         total = max((end - start).total_seconds(), 1)
         remaining = min(max((end - now).total_seconds() / total, 0), 1)
         FillRect(dc, byref(w.RECT(0, rect.bottom - bar, rect.right, rect.bottom)), self.brushes["track"])
-        FillRect(dc, byref(w.RECT(0, rect.bottom - bar, round(rect.right * remaining), rect.bottom)), self.brushes["link"])
+        FillRect(dc, byref(w.RECT(0, rect.bottom - bar, round(rect.right * remaining), rect.bottom)), self.brushes["green" if item.rest else "link"])
 
     def _on_timer(self):
-        if self.block and datetime.now() >= self.block[2]:
+        if self.item and datetime.now() >= self.item.end:
             self.agent.tick()
         elif self.hwnd:
             InvalidateRect(self.hwnd, None, False)
@@ -299,18 +321,28 @@ class TimerPill:
         self.agent.store.set_setting("pill_pos", f"{rect.left},{rect.top}")
 
     def _menu(self, x, y):
-        if not self.block:
+        item = self.item
+        if not item:
             return
-        task = self.block[0]
-        items = [(self.MENU_EXTEND, "Thêm 5 phút", False, True), (self.MENU_FINISH, "Kết thúc khối", False, True),
-                 (0, "", False, True), (self.MENU_HIDE, "Ẩn đồng hồ", False, True)]
-        chosen = show_context_menu(self.hwnd, items, x, y)
+        if item.kind == "block":
+            items = [(self.MENU_EXTEND, "Thêm 5 phút", False, True), (self.MENU_FINISH, "Kết thúc khối", False, True)]
+        else:
+            items = [(self.MENU_PAUSE, "Tạm dừng", False, True), (self.MENU_SKIP, "Bỏ qua phiên này", False, True),
+                     (self.MENU_STOP, "Dừng Pomodoro", False, True)]
+        chosen = show_context_menu(self.hwnd, items + [(0, "", False, True), (self.MENU_HIDE, "Ẩn đồng hồ", False, True)], x, y)
+        store = self.agent.store
         if chosen == self.MENU_EXTEND:
-            self.agent.store.extend_block(task["id"], 5)
+            store.extend_block(item.task_id, 5)
         elif chosen == self.MENU_FINISH:
-            self.agent.store.end_block(task["id"])
+            store.end_block(item.task_id)
+        elif chosen in (self.MENU_PAUSE, self.MENU_SKIP, self.MENU_STOP):
+            from . import pomodoro
+            if chosen == self.MENU_PAUSE:
+                pomodoro.pause(store, datetime.now())
+            else:
+                (pomodoro.skip if chosen == self.MENU_SKIP else pomodoro.stop)(store)
         elif chosen == self.MENU_HIDE:
-            self.hidden_stamp = task["block_start"]
+            self.hidden_stamp = item.stamp
         if chosen:
             self.agent.tick()
 
@@ -330,7 +362,7 @@ class TimerPill:
                 self._save_position()
                 return 0
             if message == WM_NCLBUTTONDBLCLK:
-                self.agent.open_ui()
+                self.agent.open_page("pomodoro" if self.item and self.item.kind == "pomo" else "dashboard")
                 return 0
             if message == WM_NCRBUTTONUP:
                 self._menu(signed_word(lparam), signed_word(lparam >> 16))
@@ -411,7 +443,7 @@ class ReminderCard:
         self.colors = palette(self.agent.store.setting("theme"))
         style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         self.hwnd = CreateWindowExW(style, self.CLASS, f"{APP_NAME} Reminder", WS_POPUP, 0, 0, 1, 1, None, None, HINSTANCE, None)
-        dpi = GetDpiForWindow(self.hwnd)
+        dpi = _text_dpi(self.hwnd, self.agent.store)
         self.scale = dpi / 96
         width, height = round(self.WIDTH * self.scale), round(self.HEIGHT * self.scale)
         area = _work_area(0, 0)
@@ -422,8 +454,8 @@ class ReminderCard:
             bottom -= round(pill.HEIGHT * self.scale) + gap
         SetWindowPos(self.hwnd, None, area.right - width - gap, bottom - height, width, height, SWP_NOZORDER | SWP_NOACTIVATE)
         set_window_rounded(self.hwnd)
-        self.fonts = {"small": _font(9, dpi), "title": _font(11.5, dpi, FW_NORMAL, FONT_SEMIBOLD), "body": _font(9.5, dpi),
-                      "button": _font(9.5, dpi, FW_NORMAL, FONT_SEMIBOLD), "glyph": _font(8, dpi, FW_NORMAL, FONT_ICONS)}
+        self.fonts = {"small": _font(9, dpi), "title": _font(11.5, dpi, FONT_SEMIBOLD), "body": _font(9.5, dpi),
+                      "button": _font(9.5, dpi, FONT_SEMIBOLD), "glyph": _font(8, dpi, FONT_ICONS)}
         self.brushes = {name: CreateSolidBrush(color) for name, color in self.colors.items()}
         icon_size = round(20 * self.scale)
         self.icon = LoadImageW(None, ICON_PATH, IMAGE_ICON, icon_size, icon_size, LR_LOADFROMFILE)

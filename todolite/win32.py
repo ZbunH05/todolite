@@ -17,11 +17,13 @@ WM_APP_DATA = WM_APP + 1  # dữ liệu vừa đổi: agent tính lại lịch n
 WM_APP_OPEN = WM_APP + 2  # yêu cầu mở giao diện
 WM_APP_SUMMARY = WM_APP + 3  # gửi lại tóm tắt hôm nay
 WM_APP_TRAY = WM_APP + 4  # sự kiện từ icon khay hệ thống
+WM_APP_TRIM = WM_APP + 5  # luồng nghe Telegram vừa gửi lệnh chờ: hẹn trả RAM vật lý
 
 # Kiểu cửa sổ
 WS_POPUP, WS_CHILD, WS_VISIBLE = 0x80000000, 0x40000000, 0x10000000
 WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x08, 0x80, 0x08000000
-CS_DBLCLKS, CS_DROPSHADOW = 0x08, 0x20000
+CS_VREDRAW, CS_HREDRAW, CS_DBLCLKS, CS_DROPSHADOW = 0x01, 0x02, 0x08, 0x20000
+GCL_STYLE = -26
 ES_AUTOHSCROLL, EN_CHANGE, EM_SETSEL = 0x80, 0x300, 0xB1
 SW_HIDE, SW_SHOWNORMAL, SW_SHOWNOACTIVATE, SW_RESTORE = 0, 1, 4, 9
 MA_NOACTIVATE, TME_LEAVE = 3, 0x02
@@ -46,12 +48,14 @@ SM_CXSMICON, SM_CYSMICON = 49, 50
 PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC = 0x07, 0x12
 WTS_SESSION_UNLOCK, WTS_SESSION_LOCK = 0x08, 0x07
 ERROR_ALREADY_EXISTS = 183
+WAIT_OBJECT_0 = 0
 MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTONEAREST = 0, 2
 ASFW_ANY = 0xFFFFFFFF
+FR_PRIVATE = 0x10
 MB_ICONASTERISK = 0x40
 QUNS_ACCEPTS_NOTIFICATIONS, QUNS_QUIET_TIME = 5, 6
 DPI_PER_MONITOR_V2 = -4
-DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND = 33, 2
+DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWMWA_BORDER_COLOR = 33, 2, 34
 
 # GDI
 TRANSPARENT, SRCCOPY, NULL_PEN, DI_NORMAL = 1, 0x00CC0020, 8, 0x03
@@ -94,6 +98,18 @@ class MONITORINFO(Structure):
     _fields_ = [("cbSize", w.DWORD), ("rcMonitor", w.RECT), ("rcWork", w.RECT), ("dwFlags", w.DWORD)]
 
 
+class STARTUPINFOW(Structure):
+    _fields_ = [("cb", w.DWORD), ("lpReserved", w.LPWSTR), ("lpDesktop", w.LPWSTR), ("lpTitle", w.LPWSTR), ("dwX", w.DWORD),
+                ("dwY", w.DWORD), ("dwXSize", w.DWORD), ("dwYSize", w.DWORD), ("dwXCountChars", w.DWORD),
+                ("dwYCountChars", w.DWORD), ("dwFillAttribute", w.DWORD), ("dwFlags", w.DWORD), ("wShowWindow", w.WORD),
+                ("cbReserved2", w.WORD), ("lpReserved2", c_void_p), ("hStdInput", w.HANDLE), ("hStdOutput", w.HANDLE),
+                ("hStdError", w.HANDLE)]
+
+
+class PROCESS_INFORMATION(Structure):
+    _fields_ = [("hProcess", w.HANDLE), ("hThread", w.HANDLE), ("dwProcessId", w.DWORD), ("dwThreadId", w.DWORD)]
+
+
 def _bind(dll, name, restype, *argtypes):
     function = getattr(dll, name)
     function.restype, function.argtypes = restype, argtypes
@@ -109,6 +125,11 @@ CreateMutexW = _bind(_kernel32, "CreateMutexW", w.HANDLE, c_void_p, w.BOOL, w.LP
 GetModuleHandleW = _bind(_kernel32, "GetModuleHandleW", w.HMODULE, w.LPCWSTR)
 GetCurrentProcess = _bind(_kernel32, "GetCurrentProcess", w.HANDLE)
 K32EmptyWorkingSet = _bind(_kernel32, "K32EmptyWorkingSet", w.BOOL, w.HANDLE)
+CreateProcessW = _bind(_kernel32, "CreateProcessW", w.BOOL, w.LPCWSTR, w.LPWSTR, c_void_p, c_void_p, w.BOOL, w.DWORD, c_void_p,
+                       w.LPCWSTR, POINTER(STARTUPINFOW), POINTER(PROCESS_INFORMATION))
+WaitForSingleObject = _bind(_kernel32, "WaitForSingleObject", w.DWORD, w.HANDLE, w.DWORD)
+GetExitCodeProcess = _bind(_kernel32, "GetExitCodeProcess", w.BOOL, w.HANDLE, w.LPDWORD)
+CloseHandle = _bind(_kernel32, "CloseHandle", w.BOOL, w.HANDLE)
 
 RegisterClassExW = _bind(_user32, "RegisterClassExW", w.ATOM, POINTER(WNDCLASSEXW))
 CreateWindowExW = _bind(_user32, "CreateWindowExW", w.HWND, w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, c_int, c_int,
@@ -136,6 +157,8 @@ SetWindowPos = _bind(_user32, "SetWindowPos", w.BOOL, w.HWND, w.HWND, c_int, c_i
 GetWindowRect = _bind(_user32, "GetWindowRect", w.BOOL, w.HWND, POINTER(w.RECT))
 GetClientRect = _bind(_user32, "GetClientRect", w.BOOL, w.HWND, POINTER(w.RECT))
 GetDpiForWindow = _bind(_user32, "GetDpiForWindow", w.UINT, w.HWND)
+GetClassLongPtrW = _bind(_user32, "GetClassLongPtrW", ctypes.c_size_t, w.HWND, c_int)
+SetClassLongPtrW = _bind(_user32, "SetClassLongPtrW", ctypes.c_size_t, w.HWND, c_int, ctypes.c_size_t)
 GetCursorPos = _bind(_user32, "GetCursorPos", w.BOOL, POINTER(w.POINT))
 MonitorFromPoint = _bind(_user32, "MonitorFromPoint", w.HANDLE, w.POINT, w.DWORD)
 GetMonitorInfoW = _bind(_user32, "GetMonitorInfoW", w.BOOL, w.HANDLE, POINTER(MONITORINFO))
@@ -161,6 +184,7 @@ FillRect = _bind(_user32, "FillRect", c_int, w.HDC, POINTER(w.RECT), w.HBRUSH)
 DrawTextW = _bind(_user32, "DrawTextW", c_int, w.HDC, w.LPCWSTR, c_int, POINTER(w.RECT), w.UINT)
 SetProcessDpiAwarenessContext = _bind(_user32, "SetProcessDpiAwarenessContext", w.BOOL, c_ssize_t)
 
+AddFontResourceExW = _bind(_gdi32, "AddFontResourceExW", c_int, w.LPCWSTR, w.DWORD, c_void_p)
 CreateFontW = _bind(_gdi32, "CreateFontW", w.HFONT, c_int, c_int, c_int, c_int, c_int, w.DWORD, w.DWORD, w.DWORD,
                     w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.LPCWSTR)
 CreateSolidBrush = _bind(_gdi32, "CreateSolidBrush", w.HBRUSH, w.COLORREF)
@@ -184,10 +208,17 @@ SHQueryUserNotificationState = _bind(_shell32, "SHQueryUserNotificationState", c
 HINSTANCE = GetModuleHandleW(None)
 
 
-def set_window_rounded(hwnd):
-    """Bo góc chuẩn Windows 11 (có khử răng cưa, do DWM vẽ)."""
-    ctypes.WinDLL("dwmapi").DwmSetWindowAttribute(
-        w.HWND(hwnd), DWMWA_WINDOW_CORNER_PREFERENCE, byref(c_int(DWMWCP_ROUND)), sizeof(c_int))
+def load_private_fonts(paths):
+    """Nạp font chỉ cho tiến trình này, không cài vào Windows. Trả về True nếu nạp được hết."""
+    return all([AddFontResourceExW(path, FR_PRIVATE, None) for path in paths])
+
+
+def set_window_rounded(hwnd, border=None):
+    """Bo góc chuẩn Windows 11 (có khử răng cưa, do DWM vẽ). border là màu viền '#RRGGBB': viền vẽ trong cửa sổ sẽ bị góc bo cắt mất."""
+    dwm = ctypes.WinDLL("dwmapi")
+    dwm.DwmSetWindowAttribute(w.HWND(hwnd), DWMWA_WINDOW_CORNER_PREFERENCE, byref(c_int(DWMWCP_ROUND)), sizeof(c_int))
+    if border:
+        dwm.DwmSetWindowAttribute(w.HWND(hwnd), DWMWA_BORDER_COLOR, byref(c_int(colorref(border))), sizeof(c_int))
 
 
 def register_session_notification(hwnd):
@@ -199,6 +230,11 @@ def user_is_available():
     state = c_int()
     SHQueryUserNotificationState(byref(state))
     return state.value in (QUNS_ACCEPTS_NOTIFICATIONS, QUNS_QUIET_TIME)
+
+
+def keep_content_on_resize(hwnd):
+    """Bỏ hai cờ bắt vẽ lại toàn bộ cửa sổ, mọi cửa sổ con, ở mỗi bước kéo giãn. Tk bật sẵn cho lớp cửa sổ của nó."""
+    SetClassLongPtrW(hwnd, GCL_STYLE, GetClassLongPtrW(hwnd, GCL_STYLE) & ~(CS_HREDRAW | CS_VREDRAW))
 
 
 def colorref(value):
@@ -234,6 +270,24 @@ def acquire_mutex(name):
     """Giữ mutex suốt đời tiến trình. Trả về None nếu đã có instance khác."""
     handle = CreateMutexW(None, False, name)
     return None if ctypes.get_last_error() == ERROR_ALREADY_EXISTS else handle
+
+
+def start_hidden(program, command, folder):
+    """Chạy một tiến trình, trả về handle để chờ. Không qua Shell nên gọi được từ luồng phụ chưa khởi tạo COM."""
+    startup, process = STARTUPINFOW(cb=sizeof(STARTUPINFOW)), PROCESS_INFORMATION()
+    if not CreateProcessW(program, ctypes.create_unicode_buffer(command), None, None, False, 0, None, folder, byref(startup), byref(process)):
+        return None
+    CloseHandle(process.hThread)
+    return process.hProcess
+
+
+def wait_process(process, seconds):
+    """Chờ tiến trình xong rồi đóng handle. Trả về mã thoát, hoặc None nếu nó chạy quá lâu."""
+    finished = WaitForSingleObject(process, seconds * 1000) == WAIT_OBJECT_0
+    code = w.DWORD()
+    GetExitCodeProcess(process, byref(code))
+    CloseHandle(process)
+    return code.value if finished else None
 
 
 def post_agent(message):

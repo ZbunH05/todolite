@@ -298,5 +298,78 @@ class Text(unittest.TestCase):
         self.assertEqual(summary_message([], [], NOW)[0], "Hôm nay chưa có việc nào")
 
 
+class Groups(unittest.TestCase):
+    TODAY = NOW.date()  # Thứ Bảy 31/10/2026
+
+    def names(self, tasks):
+        return [group.name for group in schedule.group_tasks(tasks, NOW)]
+
+    def test_day_heading(self):
+        self.assertEqual(schedule.day_heading(self.TODAY, self.TODAY), "Hôm nay")
+        self.assertEqual(schedule.day_heading(date(2026, 11, 1), self.TODAY), "Ngày mai · Chủ Nhật 01/11")
+        self.assertEqual(schedule.day_heading(date(2026, 10, 30), self.TODAY), "Hôm qua · Thứ Sáu 30/10")
+        self.assertEqual(schedule.day_heading(date(2026, 11, 2), self.TODAY), "Thứ Hai 02/11")
+        self.assertEqual(schedule.day_heading(date(2027, 1, 2), date(2026, 12, 25)), "Thứ Bảy 02/01/2027")
+
+    def test_month_heading(self):
+        self.assertEqual(schedule.month_heading(2026, 12, self.TODAY), "Tháng 12")
+        self.assertEqual(schedule.month_heading(2027, 1, self.TODAY), "Tháng 1, 2027")
+
+    def test_groups_keep_screen_order(self):
+        tasks = [task(due_at="2026-10-29 09:00"), task(due_at="2026-10-31 18:00"), task(due_at="2026-11-01 09:00"),
+                 task(due_at="2026-11-03 23:59", all_day=1), task(due_at="2026-11-14 09:00"), task(due_at="2026-11-15 09:00"),
+                 task(due_at="2026-12-20 09:00"), task(due_at="2027-01-05 09:00"), task(due_at=None)]
+        self.assertEqual(self.names(tasks), ["Quá hạn", "Hôm nay", "Ngày mai · Chủ Nhật 01/11", "Thứ Ba 03/11", "Thứ Bảy 14/11",
+                                             "Tháng 11", "Tháng 12", "Tháng 1, 2027", "Chưa có hạn"])
+
+    def test_empty_groups_are_dropped(self):
+        self.assertEqual(self.names([]), [])
+        self.assertEqual(self.names([task(due_at=None)]), ["Chưa có hạn"])
+
+    def test_tasks_of_a_day_stay_together_in_order(self):
+        first, second = task(id=1, due_at="2026-11-02 09:00"), task(id=2, due_at="2026-11-02 17:00")
+        group = schedule.group_tasks([first, second], NOW)[0]
+        self.assertEqual(group.name, "Thứ Hai 02/11")
+        self.assertEqual([item["id"] for item in group.tasks], [1, 2])
+
+    def test_days_sort_even_if_rows_do_not(self):
+        tasks = [task(due_at="2026-11-05 09:00"), task(due_at="2026-11-02 09:00")]
+        self.assertEqual(self.names(tasks), ["Thứ Hai 02/11", "Thứ Năm 05/11"])
+
+    def test_late_today_counts_as_overdue(self):
+        groups = schedule.group_tasks([task(due_at="2026-10-31 09:00"), task(due_at="2026-10-31 23:59", all_day=1)], NOW)
+        self.assertEqual([(group.name, group.tone) for group in groups], [("Quá hạn", "late"), ("Hôm nay", "today")])
+
+    def test_group_done_by_finish_day(self):
+        tasks = [task(done_at="2026-10-31 09:00"), task(done_at="2026-10-31 08:00"), task(done_at="2026-10-30 22:00"), task(done_at="2026-10-20 22:00")]
+        groups = schedule.group_done(tasks, self.TODAY)
+        self.assertEqual([group.name for group in groups], ["Hôm nay", "Hôm qua · Thứ Sáu 30/10", "Thứ Ba 20/10"])
+        self.assertEqual([len(group.tasks) for group in groups], [2, 1, 1])
+
+    def test_day_group_rows_only_say_the_time(self):
+        self.assertEqual(schedule.row_when(task(due_at="2026-11-01 09:30"), schedule.SHOWS_TIME, NOW), "09:30")
+        self.assertEqual(schedule.row_when(task(due_at="2026-11-01 23:59", all_day=1), schedule.SHOWS_TIME, NOW), "")
+
+    def test_month_group_rows_say_the_day(self):
+        self.assertEqual(schedule.row_when(task(due_at="2026-12-20 09:30"), schedule.SHOWS_DAY, NOW), "20/12 09:30")
+        self.assertEqual(schedule.row_when(task(due_at="2026-12-20 23:59", all_day=1), schedule.SHOWS_DAY, NOW), "20/12")
+        self.assertEqual(schedule.row_when(task(due_at="2027-01-05 23:59", all_day=1), schedule.SHOWS_DAY, NOW), "05/01")
+
+    def test_overdue_rows_say_everything(self):
+        self.assertEqual(schedule.row_when(task(due_at="2026-10-29 09:26"), schedule.SHOWS_ALL, NOW), "29/10 09:26")
+        self.assertEqual(schedule.row_when(task(due_at="2026-10-30 09:26"), schedule.SHOWS_ALL, NOW), "Hôm qua 09:26")
+        self.assertEqual(schedule.row_when(task(due_at="2026-10-31 09:26"), schedule.SHOWS_ALL, NOW), "09:26")
+        self.assertEqual(schedule.row_when(task(due_at="2026-10-31 23:59", all_day=1), schedule.SHOWS_ALL, NOW), "Cả ngày")
+
+    def test_block_on_the_due_day_needs_no_day(self):
+        row = task(due_at="2026-11-05 09:00", block_start="2026-11-05 08:00", block_minutes=60)
+        self.assertEqual(schedule.block_label(row, NOW), "08:00–09:00")
+
+    def test_block_on_another_day_names_it(self):
+        row = task(due_at="2026-11-05 09:00", block_start="2026-11-04 14:00", block_minutes=120)
+        self.assertEqual(schedule.block_label(row, NOW), "T4 14:00–16:00")
+        self.assertEqual(schedule.block_label(task(block_start="2026-10-31 14:00", block_minutes=60), NOW), "Hôm nay 14:00–15:00")
+
+
 if __name__ == "__main__":
     unittest.main()

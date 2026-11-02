@@ -73,8 +73,19 @@ CREATE TABLE task_tags (
 CREATE INDEX idx_task_tags_tag ON task_tags(tag_id);
 """
 
+SCHEMA_V3 = """
+CREATE TABLE focus_sessions (
+    id         INTEGER PRIMARY KEY,
+    task_id    INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    started_at TEXT    NOT NULL,                 -- 'YYYY-MM-DD HH:MM:SS', giờ địa phương
+    minutes    INTEGER NOT NULL
+);
+CREATE INDEX idx_focus_started ON focus_sessions(started_at);
+"""
+
 DEFAULT_SETTINGS = {
     "theme": "dark",             # light | dark | system
+    "text_scale": "1",           # hệ số cỡ chữ, xem TEXT_SCALES trong ui/theme.py
     "summary_time": "07:30",     # PC bật xuyên đêm vẫn nhận tóm tắt mỗi sáng
     "default_remind": "30,15",
     "hotkey": "1",
@@ -94,23 +105,41 @@ DEFAULT_SETTINGS = {
     "telegram_last_sent": "",
     "telegram_failed_on": "",
     "telegram_status": "",
+    "telegram_inbox": "1",       # thêm việc bằng tin nhắn gửi cho bot
+    "telegram_inbox_since": "",  # giờ Unix, tin cũ hơn mốc này không thành việc
+    "telegram_last_message": "", # 'chat:mã tin' đã xử lý, chống ghi trùng khi Telegram gửi lại
+    "telegram_last_added": "",   # các việc của tin gần nhất, dành cho lệnh /huy
+    "telegram_commands": "",     # phiên bản menu lệnh đã đăng ký với Telegram, xem bot.COMMANDS
     "ai_url": "https://api.deepseek.com/chat/completions",
     "ai_key": "",                # đã mã hoá bằng DPAPI
     "ai_model": "deepseek-flash",
     "birth_date": "",
+    "telegram_remind": "1440,60",  # số phút nhắc trước hạn qua Telegram, rỗng là tắt
+    "quote_topics": "",          # chủ đề của Câu nói hôm nay, rỗng là cả sáu chủ đề (xem quotes.py)
+    "pomo_focus": "25",          # Pomodoro: số phút của từng loại phiên, xem pomodoro.py
+    "pomo_short": "5",
+    "pomo_long": "15",
+    "pomo_rounds": "4",          # sau từng này phiên tập trung thì nghỉ dài
+    "pomo_auto_break": "1",
+    "pomo_auto_focus": "0",
+    "pomo_phase": "focus",
+    "pomo_end": "",              # giờ hết phiên khi đồng hồ đang chạy
+    "pomo_left": "",             # số giây còn lại khi đang tạm dừng
+    "pomo_round": "0",           # số phiên tập trung đã xong trong vòng hiện tại
+    "pomo_task": "",
+    "pomo_notice": "",           # lần chuyển phiên gần nhất 'mốc|tiêu đề|dòng', agent hiện thông báo
 }
 
 EDITABLE = frozenset(("title", "notes", "priority", "due_at", "all_day", "remind", "recur",
                       "block_start", "block_minutes", "snooze_until"))
 
 TASK_SELECT = f"""
-SELECT t.*, COALESCE(c.total, 0) AS cp_total, COALESCE(c.closed, 0) AS cp_done,
+SELECT t.*, (SELECT COUNT(*) FROM checkpoints c WHERE c.task_id = t.id) AS cp_total,
+       (SELECT COALESCE(SUM(c.done), 0) FROM checkpoints c WHERE c.task_id = t.id) AS cp_done,
        (SELECT GROUP_CONCAT(name, char({ord(TAG_SEPARATOR)})) FROM (
             SELECT g.name FROM task_tags k JOIN tags g ON g.id = k.tag_id
             WHERE k.task_id = t.id ORDER BY g.position, g.id)) AS tag_names
 FROM tasks t
-LEFT JOIN (SELECT task_id, COUNT(*) AS total, SUM(done) AS closed FROM checkpoints GROUP BY task_id) c
-       ON c.task_id = t.id
 """
 OPEN_ORDER = " ORDER BY t.due_at IS NULL, t.due_at, t.priority DESC, t.id"
 
@@ -168,7 +197,12 @@ def _add_tags(conn):
     conn.execute("ALTER TABLE tasks DROP COLUMN tag")
 
 
-MIGRATIONS = (_create_schema, _add_tags)
+def _add_focus_sessions(conn):
+    """Lịch sử các phiên Pomodoro đã xong, để đếm số phiên và số phút tập trung theo ngày."""
+    _run_script(conn, SCHEMA_V3)
+
+
+MIGRATIONS = (_create_schema, _add_tags, _add_focus_sessions)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -410,6 +444,25 @@ class Store:
     def end_block(self, task_id):
         self.update_task(task_id, block_start=None)
 
+    # ---------- Pomodoro ----------
+
+    def add_focus_session(self, task_id, started_at, minutes):
+        """Ghi một phiên tập trung đã xong. Việc gắn với phiên đã bị xoá thì phiên vẫn được tính, chỉ không gắn với việc nào."""
+        exists = task_id and self.conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone()
+        self.conn.execute("INSERT INTO focus_sessions(task_id, started_at, minutes) VALUES(?, ?, ?)",
+                          (task_id if exists else None, started_at, minutes))
+
+    def focus_stats(self, now):
+        """Số phiên và số phút tập trung hôm nay, số phút của từng ngày trong 7 ngày qua (ngày cuối là hôm nay)."""
+        today = now.date()
+        first = today - timedelta(days=6)
+        rows = {row[0]: (row[1], row[2]) for row in self.conn.execute(
+            "SELECT substr(started_at, 1, 10), COUNT(*), SUM(minutes) FROM focus_sessions WHERE started_at >= ? GROUP BY 1",
+            (first.isoformat(),))}
+        count, minutes = rows.get(today.isoformat(), (0, 0))
+        days = [first + timedelta(days=offset) for offset in range(7)]
+        return {"count": count, "minutes": minutes, "week": [(day, rows.get(day.isoformat(), (0, 0))[1]) for day in days]}
+
     # ---------- Checkpoint ----------
 
     def checkpoints(self, task_id):
@@ -450,6 +503,9 @@ class Store:
             where.append("t.done_at IS NULL")
         elif view == "done":
             where.append("t.done_at IS NOT NULL")
+        elif view == "done_today":
+            where += ["t.done_at >= ?", "t.done_at < ?"]
+            params += [now.date().isoformat(), day_end]
         else:
             raise ValueError(view)
         if tag:
@@ -459,7 +515,7 @@ class Store:
             where.append("(t.title LIKE ? ESCAPE '\\' OR t.notes LIKE ? ESCAPE '\\')")
             pattern = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             params += [pattern, pattern]
-        order = " ORDER BY t.done_at DESC, t.id DESC LIMIT 300" if view == "done" else OPEN_ORDER
+        order = " ORDER BY t.done_at DESC, t.id DESC LIMIT 300" if view.startswith("done") else OPEN_ORDER
         return self.conn.execute(f"{TASK_SELECT} WHERE {' AND '.join(where)}{order}", params).fetchall()
 
     def calendar_tasks(self, first, last, tag=0):
@@ -502,8 +558,7 @@ class Store:
             "AND t.block_minutes > 0 ORDER BY t.block_start", (day, next_day)).fetchall()
 
     def nearest_deadline(self, now):
-        return self.conn.execute(TASK_SELECT + " WHERE t.done_at IS NULL AND t.all_day = 0 AND t.due_at > ? "
-                                 "ORDER BY t.due_at LIMIT 1", (to_text(now),)).fetchone()
+        return self.conn.execute(TASK_SELECT + " WHERE t.done_at IS NULL AND t.due_at > ? ORDER BY t.due_at LIMIT 1", (to_text(now),)).fetchone()
 
     # ---------- Dành cho agent ----------
 
